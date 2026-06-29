@@ -30,45 +30,39 @@ def build_irmodule(config: Pi0Config):
     return model, mod, named_params, ext_mods
 
 
-def _make_pipeline():
+def compile_model(config: Pi0Config, target: str = "c"):
+    """编译模型，返回 (VM 可加载对象, named_params)。
+
+    - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
+    - GPU 目标（cuda/metal/...）：使用 target 感知的默认 pipeline。
+    """
+    import os
+    import tempfile
+
     import tvm
-    from tvm import relax
-
-    @tvm.transform.module_pass(opt_level=0, name="mlc_vla_m0")
-    def _pipeline(mod, _ctx):
-        seq = tvm.transform.Sequential(
-            [
-                relax.transform.LegalizeOps(),
-                relax.transform.AnnotateTIROpPattern(),
-                relax.transform.FoldConstant(),
-                relax.transform.FuseOps(),
-                relax.transform.FuseTIR(),
-            ]
-        )
-        return seq(mod)
-
-    return _pipeline
-
-
-def compile_model(config: Pi0Config, target: str = "llvm"):
-    import tvm
-    from tvm import dlight as dl
     from tvm import relax
 
     _, mod, named_params, _ = build_irmodule(config)
     tgt = tvm.target.Target(target)
+    if tgt.kind.name == "c":
+        mod = relax.get_pipeline("zero")(mod)
+        ex = relax.build(mod, target=tgt)
+        so_path = os.path.join(tempfile.mkdtemp(prefix="mlc_vla_"), "pi0.so")
+        ex.export_library(so_path)
+        return tvm.runtime.load_module(so_path), named_params
+    relax_pipeline = relax.get_default_pipeline(tgt)
     with tgt:
-        mod = _make_pipeline()(mod)
-        if tgt.kind.name != "llvm":
-            mod = dl.ApplyDefaultSchedule(
-                dl.gpu.Matmul(),
-                dl.gpu.GEMV(),
-                dl.gpu.Reduction(),
-                dl.gpu.GeneralReduction(),
-                dl.gpu.Fallback(),
-            )(mod)
-    ex = relax.build(mod, target=tgt)
+        ex = relax.build(mod, target=tgt, relax_pipeline=relax_pipeline)
     return ex, named_params
+
+
+def _device_for(target: str):
+    import tvm
+
+    tgt = tvm.target.Target(target)
+    if tgt.kind.name == "c":
+        return tvm.cpu(0)
+    return tvm.device(tgt.kind.name, 0)
 
 
 def _random_params(named_params, dev):
@@ -85,13 +79,13 @@ def _random_params(named_params, dev):
     return params
 
 
-def smoke_test(config: Pi0Config, target: str = "llvm"):
+def smoke_test(config: Pi0Config, target: str = "c"):
     """随机权重跑一次 denoise_step，验证图自洽。"""
     import tvm
     from tvm import relax
 
     ex, named_params = compile_model(config, target)
-    dev = tvm.device(target, 0)
+    dev = _device_for(target)
     vm = relax.VirtualMachine(ex, dev)
     params = _random_params(named_params, dev)
 
@@ -112,7 +106,7 @@ def smoke_test(config: Pi0Config, target: str = "llvm"):
 
 def main():
     ap = argparse.ArgumentParser(description="MLC-VLA π0.5 compile / smoke (M0)")
-    ap.add_argument("--target", default="llvm")
+    ap.add_argument("--target", default="c")
     ap.add_argument("--smoke", action="store_true", help="随机权重跑通 denoise_step")
     ap.add_argument("--dump-ir", action="store_true", help="打印导出的 relax IRModule")
     ap.add_argument("--dummy", action="store_true", help="用 dummy 小尺寸专家，加速验证")

@@ -56,8 +56,8 @@ class GemmaRMSNorm(nn.Module):
         self.use_adarms = use_adarms
         if use_adarms:
             assert cond_dim is not None
-            # modulation: cond -> [scale, shift, gate]，对齐 openpi 的 zero-init Dense(3*dim)
-            self.modulation = nn.Linear(cond_dim, dim * 3, bias=False)
+            # modulation: cond -> [scale, shift, gate]，对齐 openpi 的 Dense(3*dim, bias=True)
+            self.modulation = nn.Linear(cond_dim, dim * 3, bias=True)
         else:
             # 普通 RMSNorm：存原始 scale，forward 里 (1 + scale)
             self.weight = nn.Parameter((dim,))
