@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlc-vla"
+version = "0.0.1.dev0"
+description = "TVM 的 VLA（Vision-Language-Action）垂直领域实现，首个目标为 π0.5"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    # TVM (Unity/Relax) 需单独安装/构建，见 README
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mlc_vla*"]
