@@ -20,21 +20,29 @@ import numpy as np
 from mlc_vla.model.pi0 import Pi0Config, Pi0Model
 
 
-def build_irmodule(config: Pi0Config):
-    """实例化模型并导出 relax IRModule + 参数规格。"""
+def build_irmodule(config: Pi0Config, functions=None):
+    """实例化模型并导出 relax IRModule + 参数规格。
+
+    ``functions``：可选子函数列表（如 ``["denoise_step"]``）。bf16 编译时建议只导出
+    ``denoise_step`` 以绕开 SigLIP 的 layer_norm（TVM 暂不支持 bf16 layer_norm）。
+    """
     model = Pi0Model(config)
+    # 把参数 dtype 统一到 config.dtype（fp16/bf16 省显存；默认 fp32 时为 no-op）
+    model.to(config.dtype)
     mod, named_params, ext_mods = model.export_tvm(
-        spec=model.get_default_spec(),
+        spec=model.get_default_spec(functions=functions),
         allow_extern=True,
     )
     return model, mod, named_params, ext_mods
 
 
-def compile_model(config: Pi0Config, target: str = "c"):
+def compile_model(config: Pi0Config, target: str = "c", functions=None, cuda_graph: bool = False):
     """编译模型，返回 (VM 可加载对象, named_params)。
 
     - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
     - GPU 目标（cuda/metal/...）：使用 target 感知的默认 pipeline。
+    - ``cuda_graph``：CUDA 目标下开启 ``RewriteCUDAGraph``，把去噪步的静态 kernel 序列
+      捕获成 CUDA Graph（一次 launch 重放），降低 host 端多 kernel launch 开销。
     """
     import os
     import tempfile
@@ -42,8 +50,11 @@ def compile_model(config: Pi0Config, target: str = "c"):
     import tvm
     from tvm import relax
 
-    _, mod, named_params, _ = build_irmodule(config)
+    _, mod, named_params, _ = build_irmodule(config, functions=functions)
     tgt = tvm.target.Target(target)
+    # CUDA 13.x 的 NVRTC JIT 无法编译 cuda_fp8.hpp（double4_16a 未定义），改用 nvcc 子进程。
+    if tgt.kind.name == "cuda":
+        os.environ.setdefault("TVM_CUDA_COMPILE_MODE", "nvcc")
     if tgt.kind.name == "c":
         mod = relax.get_pipeline("zero")(mod)
         ex = relax.build(mod, target=tgt)
@@ -51,7 +62,8 @@ def compile_model(config: Pi0Config, target: str = "c"):
         ex.export_library(so_path)
         return tvm.runtime.load_module(so_path), named_params
     relax_pipeline = relax.get_default_pipeline(tgt)
-    with tgt:
+    pass_cfg = {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}
+    with tgt, tvm.transform.PassContext(config=pass_cfg):
         ex = relax.build(mod, target=tgt, relax_pipeline=relax_pipeline)
     return ex, named_params
 

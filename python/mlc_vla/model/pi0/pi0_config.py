@@ -78,8 +78,10 @@ class Pi0Config:
     action_expert_variant: str = "gemma_300m"
 
     # 动作空间
+    # 默认对齐随附的 LIBERO π0.5 checkpoint（models/openpi/pytorch/config.json:
+    # action_dim=32, action_horizon=10）。其它 checkpoint 可用 from_openpi_config 覆盖。
     action_dim: int = 32
-    action_horizon: int = 50
+    action_horizon: int = 10
     max_token_len: int = 200  # pi05 默认 200（pi0 为 48）
 
     # π0.5 特性：动作专家用 adaRMSNorm 注入 flow-matching timestep
@@ -130,6 +132,30 @@ class Pi0Config:
 
     def experts(self) -> List[GemmaExpertConfig]:  # noqa: UP006
         return [self.vlm, self.action_expert]
+
+    @classmethod
+    def from_openpi_config(cls, path: str, **overrides) -> "Pi0Config":
+        """从 openpi checkpoint 目录的 ``config.json`` 读取关键字段构造配置。
+
+        openpi PyTorch checkpoint 附带的 ``config.json`` 例：
+            {"action_dim": 32, "action_horizon": 10,
+             "paligemma_variant": "gemma_2b",
+             "action_expert_variant": "gemma_300m",
+             "precision": "bfloat16"}
+        """
+        import json
+        import os
+
+        if os.path.isdir(path):
+            path = os.path.join(path, "config.json")
+        with open(path) as f:
+            cfg = json.load(f)
+        kwargs: Dict[str, object] = {}  # noqa: UP006
+        for key in ("action_dim", "action_horizon", "paligemma_variant", "action_expert_variant"):
+            if key in cfg:
+                kwargs[key] = cfg[key]
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     def __post_init__(self):
         a, b = self.vlm, self.action_expert

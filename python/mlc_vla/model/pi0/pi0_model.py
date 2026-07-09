@@ -93,13 +93,43 @@ class Pi0Model(nn.Module):
 
         xs = [prefix_embs.astype(self.dtype), suffix_emb.astype(self.dtype)]
         outs = self.backbone(xs, cos, sin, attn_mask, [None, adarms_cond])
-        suffix_out = outs[1].astype("float32")
-        return self.action_out_proj(suffix_out)
+        # action_out_proj 在模型 dtype 下计算，最后统一回 float32（对 fp16 权重也自洽）
+        v_t = self.action_out_proj(outs[1])
+        return v_t.astype("float32")
+
+    # ---------- M1：prefix 固化 + suffix-only 去噪 ----------
+    def prefill(self, prefix_embs: Tensor):
+        """expert-0 对 prefix 跑一次，返回逐层缓存 (keys, values)。
+
+        keys/values 形状 [depth, 1, kv, prefix_len, head_dim]（keys fp32，values 模型 dtype）。
+        """
+        cos, sin = self.backbone.make_rope_tables(self.config.prefix_len, offset=0)
+        keys, values = self.backbone.prefill_prefix(prefix_embs.astype(self.dtype), cos, sin)
+        return keys, values
+
+    def denoise_step_kv(self, keys: Tensor, values: Tensor, x_t: Tensor, time_emb: Tensor) -> Tensor:
+        """suffix-only 去噪：expert-1 用外部 prefix K/V，返回 v_t [1,horizon,action_dim]。"""
+        cfg = self.config
+        # suffix 的 RoPE 位置从 prefix_len 起（对齐 openpi 的 position_ids 续接）
+        cos, sin = self.backbone.make_rope_tables(cfg.suffix_len, offset=cfg.prefix_len)
+        suffix_emb = self.action_in_proj(x_t).astype(self.dtype)
+        adarms_cond = self._time_cond(time_emb)
+        out = self.backbone.decode_suffix(suffix_emb, keys, values, cos, sin, adarms_cond)
+        v_t = self.action_out_proj(out)
+        return v_t.astype("float32")
 
     # ---------- 导出 spec ----------
-    def get_default_spec(self):
+    def get_default_spec(self, functions=None):
+        """构造导出 spec。``functions`` 可选，仅导出指定子函数（如 ["denoise_step"]）。
+
+        注：SigLIP 的 ``embed_image`` 含 ``nn.LayerNorm``，而 TVM ``layer_norm``
+        目前只支持 fp32/fp16；若要用 bf16 编译 backbone，可只导出 ``denoise_step``。
+        """
         cfg = self.config
         s = cfg.siglip
+        vlm = cfg.vlm
+        kv, hd, depth = vlm.num_kv_heads, vlm.head_dim, vlm.depth
+        kv_shape = [depth, 1, kv, cfg.prefix_len, hd]
         mod_spec = {
             "embed_image": {
                 "image": nn.spec.Tensor([1, s.image_size, s.image_size, s.num_channels], self.dtype),
@@ -115,5 +145,18 @@ class Pi0Model(nn.Module):
                 "time_emb": nn.spec.Tensor([1, self._ae_width], self.dtype),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
+            "prefill": {
+                "prefix_embs": nn.spec.Tensor([1, cfg.prefix_len, self._vlm_width], self.dtype),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "denoise_step_kv": {
+                "keys": nn.spec.Tensor(kv_shape, "float32"),
+                "values": nn.spec.Tensor(kv_shape, self.dtype),
+                "x_t": nn.spec.Tensor([1, cfg.action_horizon, cfg.action_dim], self.dtype),
+                "time_emb": nn.spec.Tensor([1, self._ae_width], self.dtype),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
         }
+        if functions is not None:
+            mod_spec = {k: mod_spec[k] for k in functions}
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)

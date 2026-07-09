@@ -21,27 +21,37 @@ from tvm.relax.frontend.nn import Tensor, op
 from .pi0_config import GemmaExpertConfig, Pi0Config
 
 
-def _rope_tables(num_positions: int, head_dim: int, theta: float, dtype: str) -> Tuple[Tensor, Tensor]:
+def _rope_tables(num_positions: int, head_dim: int, theta: float, dtype: str, offset: int = 0) -> Tuple[Tensor, Tensor]:
     """生成 RoPE 的 cos/sin 常量表，形状 [1, L, 1, head_dim//2]。
 
     对齐 openpi ``_apply_rope``：
         freq_exponents = (2/H) * arange(H/2)
         timescale      = theta ** freq_exponents
         radians        = positions / timescale
+
+    注：cos/sin 常量恒用 **float32**（与 openpi 一致）。在 bf16/fp16 模型里，位置可达上千，
+    bf16/fp16 存 cos/sin 会显著丢精度，故 rope 一律 fp32 计算，应用时再回到 x 的 dtype。
+    ``dtype`` 参数保留以兼容旧签名但不再决定 cos/sin 精度。
     """
+    del dtype  # rope 常量恒 fp32
     half = head_dim // 2
-    positions = np.arange(num_positions, dtype=np.float64)
+    positions = np.arange(offset, offset + num_positions, dtype=np.float64)
     freq_exponents = (2.0 / head_dim) * np.arange(half, dtype=np.float64)
     timescale = theta**freq_exponents
     radians = positions[:, None] / timescale[None, :]  # [L, H/2]
-    cos = np.cos(radians).reshape(1, num_positions, 1, half).astype(dtype)
-    sin = np.sin(radians).reshape(1, num_positions, 1, half).astype(dtype)
+    cos = np.cos(radians).reshape(1, num_positions, 1, half).astype("float32")
+    sin = np.sin(radians).reshape(1, num_positions, 1, half).astype("float32")
     return nn.Tensor.from_const(cos), nn.Tensor.from_const(sin)
 
 
 def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """x: [B, L, n_heads, head_dim]；cos/sin: [1, L, 1, head_dim//2]。"""
-    x1, x2 = op.split(x, 2, axis=-1)
+    """x: [B, L, n_heads, head_dim]；cos/sin: [1, L, 1, head_dim//2]（fp32）。
+
+    返回 fp32（rope 后 q/k 直接进 fp32 logits matmul，避免额外一次 bf16 round-trip，
+    与 openpi eager 路径一致）。
+    """
+    xf = x.astype("float32")
+    x1, x2 = op.split(xf, 2, axis=-1)
     first = x1 * cos - x2 * sin
     second = x2 * cos + x1 * sin
     return op.concat([first, second], dim=-1)
@@ -82,6 +92,29 @@ def _gated_residual(x: Tensor, y: Tensor, gate: Optional[Tensor]) -> Tensor:
     if gate is None:
         return x + y
     return x + y * gate
+
+
+def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int) -> Tensor:
+    """全注意力 SDPA（M1 无 mask：prefix 内全可见 / suffix 可见 prefix+全 suffix）。
+
+    q: [B,n,Tq,H]（已含 1/sqrt(H) 缩放，fp32）；kc/vc: [B,kv,Ts,H]。
+    logits 用 fp32 累加，probs 回到 vc.dtype 再与 vc 相乘（对齐 M0 / openpi）。
+    返回 encoded [B,Tq,n*H]。
+    """
+    b = q.shape[0]
+    hd = q.shape[3]
+    tq = q.shape[2]
+    ts = kc.shape[2]
+    kv = kc.shape[1]
+    if kv != num_heads:
+        kc = op.broadcast_to(kc, (b, num_heads, ts, hd))
+        vc = op.broadcast_to(vc, (b, num_heads, ts, hd))
+    kt = op.permute_dims(kc, [0, 1, 3, 2])  # [B,n,H,Ts]
+    logits = op.matmul(q.astype("float32"), kt.astype("float32"))  # [B,n,Tq,Ts]
+    probs = op.softmax(logits, axis=-1).astype(vc.dtype)
+    encoded = op.matmul(probs, vc)  # [B,n,Tq,H]
+    encoded = op.permute_dims(encoded, [0, 2, 1, 3])  # [B,Tq,n,H]
+    return op.reshape(encoded, (b, tq, num_heads * hd))
 
 
 class GemmaExpertMLP(nn.Module):
@@ -169,7 +202,7 @@ class DualExpertAttention(nn.Module):
         kt = op.permute_dims(kc, [0, 1, 3, 2])  # [B,N,H,Ts]
         logits = op.matmul(q.astype("float32"), kt.astype("float32"))  # [B,N,Tq,Ts]
         logits = logits + attn_mask.astype("float32")
-        probs = op.softmax(logits, axis=-1).astype(q.dtype)
+        probs = op.softmax(logits, axis=-1).astype(vc.dtype)
 
         encoded = op.matmul(probs, vc)  # [B,N,Tq,H]
         encoded = op.permute_dims(encoded, [0, 2, 1, 3])  # [B,Tq,N,H]
@@ -191,6 +224,45 @@ class DualExpertAttention(nn.Module):
             outs.append(self.experts[i].o_proj(chunks[c]))
             c += 1
         return outs
+
+    # ---------- M1：KV 固化 / suffix-only 解码 ----------
+    def attn_prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor):
+        """expert-0 对 prefix 自注意力，返回 (o_proj 输出, 缓存 K, 缓存 V)。
+
+        缓存 K 为 **post-rope fp32**（保精度，与 M0 一致）；V 为模型 dtype。布局 [B,kv,S,H]。
+        """
+        proj = self.experts[0]
+        n, kv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        b, t, _ = x.shape
+        q = _apply_rope(op.reshape(proj.q_proj(x), (b, t, n, hd)), cos, sin)  # fp32
+        k = _apply_rope(op.reshape(proj.k_proj(x), (b, t, kv, hd)), cos, sin)  # fp32
+        v = op.reshape(proj.v_proj(x), (b, t, kv, hd))
+        q = q * (hd**-0.5)
+        qp = op.permute_dims(q, [0, 2, 1, 3])
+        kp = op.permute_dims(k, [0, 2, 1, 3])  # [B,kv,S,H] fp32
+        vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,S,H]
+        encoded = _sdpa(qp, kp, vp, n)
+        return proj.o_proj(encoded), kp, vp
+
+    def attn_decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor) -> Tensor:
+        """expert-1 对 suffix 前向，attend 到 [prefix_kv; suffix_kv]。
+
+        pk: [B,kv,Sp,H] fp32（post-rope prefix K）；pv: [B,kv,Sp,H] 模型 dtype。
+        """
+        proj = self.experts[1]
+        n, kv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        b, t, _ = x.shape
+        q = _apply_rope(op.reshape(proj.q_proj(x), (b, t, n, hd)), cos, sin)  # fp32
+        k = _apply_rope(op.reshape(proj.k_proj(x), (b, t, kv, hd)), cos, sin)  # fp32
+        v = op.reshape(proj.v_proj(x), (b, t, kv, hd))
+        q = q * (hd**-0.5)
+        qp = op.permute_dims(q, [0, 2, 1, 3])
+        kp = op.permute_dims(k, [0, 2, 1, 3])  # [B,kv,t,H] fp32
+        vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,t,H]
+        kfull = op.concat([pk, kp], dim=2)  # [B,kv,Sp+t,H] fp32
+        vfull = op.concat([pv, vp], dim=2)  # [B,kv,Sp+t,H]
+        encoded = _sdpa(qp, kfull, vfull, n)
+        return proj.o_proj(encoded)
 
 
 class DualExpertBlock(nn.Module):
@@ -247,6 +319,25 @@ class DualExpertBlock(nn.Module):
         ]
         return xs
 
+    # ---------- M1 ----------
+    def prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor):
+        """expert-0 单层 prefill：返回 (层输出, 该层缓存 K, 缓存 V)。"""
+        normed, _ = self.input_layernorm[0](x, None)
+        attn_out, k, v = self.self_attn.attn_prefill_e0(normed, cos, sin)
+        x = x + attn_out
+        normed2, _ = self.post_attention_layernorm[0](x, None)
+        x = x + self.mlp[0](normed2)
+        return x, k, v
+
+    def decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor, cond: Optional[Tensor]) -> Tensor:
+        """expert-1 单层 decode：用外部 prefix K/V。"""
+        normed, gate = self.input_layernorm[1](x, cond)
+        attn_out = self.self_attn.attn_decode_e1(normed, cos, sin, pk, pv)
+        x = _gated_residual(x, attn_out, gate)
+        normed2, gate2 = self.post_attention_layernorm[1](x, cond)
+        x = _gated_residual(x, self.mlp[1](normed2), gate2)
+        return x
+
 
 class DualExpertGemma(nn.Module):
     """双专家 Gemma 主干：joint forward over all layers + 末端 norm。"""
@@ -284,7 +375,40 @@ class DualExpertGemma(nn.Module):
             outs.append(normed)
         return outs
 
-    def make_rope_tables(self, num_positions: int) -> Tuple[Tensor, Tensor]:
+    def make_rope_tables(self, num_positions: int, offset: int = 0) -> Tuple[Tensor, Tensor]:
         return _rope_tables(
-            num_positions, self.config.vlm.head_dim, self.config.rope_theta, self.config.dtype
+            num_positions, self.config.vlm.head_dim, self.config.rope_theta, self.config.dtype, offset
         )
+
+    # ---------- M1：prefix 固化 + suffix-only 解码 ----------
+    def prefill_prefix(self, prefix_emb: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+        """expert-0 跑完 prefix，逐层缓存 K/V。
+
+        返回 (keys, values)，形状均 [depth, B, kv, Sp, H]（keys fp32，values 模型 dtype）。
+        prefix hidden 输出（经 final_norm）去噪时不再使用，故此处不算。
+        """
+        x = prefix_emb
+        ks: List[Tensor] = []  # noqa: UP006
+        vs: List[Tensor] = []  # noqa: UP006
+        for layer in self.layers:
+            x, k, v = layer.prefill_e0(x, cos, sin)  # k,v: [B,kv,Sp,H]
+            ks.append(op.reshape(k, [1, *k.shape]))
+            vs.append(op.reshape(v, [1, *v.shape]))
+        keys = op.concat(ks, dim=0) if len(ks) > 1 else ks[0]
+        values = op.concat(vs, dim=0) if len(vs) > 1 else vs[0]
+        return keys, values
+
+    def decode_suffix(
+        self, suffix_emb: Tensor, keys: Tensor, values: Tensor, cos: Tensor, sin: Tensor,
+        adarms_cond: Optional[Tensor],
+    ) -> Tensor:
+        """expert-1 跑完 suffix，使用外部 prefix K/V。返回末端 norm 后的 suffix 隐状态。"""
+        x = suffix_emb
+        k_list = list(op.split(keys, self.depth, axis=0)) if self.depth > 1 else [keys]
+        v_list = list(op.split(values, self.depth, axis=0)) if self.depth > 1 else [values]
+        for i, layer in enumerate(self.layers):
+            pk = op.squeeze(k_list[i], axis=0)  # [B,kv,Sp,H]
+            pv = op.squeeze(v_list[i], axis=0)
+            x = layer.decode_e1(x, cos, sin, pk, pv, adarms_cond)
+        normed, _ = self.final_norm[1](x, adarms_cond)
+        return normed
