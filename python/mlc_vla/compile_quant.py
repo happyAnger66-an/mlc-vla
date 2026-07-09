@@ -17,12 +17,13 @@ import os
 import numpy as np
 
 from mlc_vla.model.pi0 import Pi0Config, Pi0Model
+from mlc_vla.model.pi0.pi0_model import include_for
 from mlc_vla.quant import QuantizeMapping, get_quant
 
 
 def fp_named_params(config: Pi0Config, functions):
     """未量化模型的 named_params（name, param），供 pi0_loader 映射真实权重。"""
-    m = Pi0Model(config)
+    m = Pi0Model(config, include=include_for(functions))
     m.to(config.dtype)
     _, named_params, _ = m.export_tvm(
         spec=m.get_default_spec(functions=functions), allow_extern=True
@@ -33,7 +34,7 @@ def fp_named_params(config: Pi0Config, functions):
 def build_quant_irmodule(config: Pi0Config, functions, quant_name: str):
     """量化 pi0 并导出 (IRModule, q_named_params, quant_map)。"""
     quant = get_quant(quant_name)
-    model = Pi0Model(config)
+    model = Pi0Model(config, include=include_for(functions))
     qmap = QuantizeMapping({}, {})
     model = quant.quantize_model(model, qmap, "")
     mod, q_named_params, _ = model.export_tvm(

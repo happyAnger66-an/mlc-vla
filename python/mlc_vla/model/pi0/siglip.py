@@ -17,6 +17,25 @@ from tvm.relax.frontend.nn import Tensor, op
 from .pi0_config import SiglipConfig
 
 
+class LayerNormF32(nn.LayerNorm):
+    """bf16-safe LayerNorm：内部以 fp32 计算再 cast 回输入 dtype。
+
+    TVM ``topi.nn.layer_norm`` 只支持 fp32/fp16；bf16 模型若直接用 ``nn.LayerNorm`` 会在
+    legalize 时报错。这里保持参数名（``weight``/``bias``）不变以复用权重加载，仅把归一化
+    计算提升到 fp32（数值上等价且更稳），使 SigLIP 的 55 个 LayerNorm 可在 bf16 下编译。
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = op.layer_norm(
+            x.astype("float32"),
+            normalized_shape=self.normalized_shape,
+            weight=self.weight.astype("float32") if self.weight is not None else None,
+            bias=self.bias.astype("float32") if self.bias is not None else None,
+            eps=self.eps,
+        )
+        return out.astype(x.dtype)
+
+
 class SiglipMLP(nn.Module):
     def __init__(self, cfg: SiglipConfig):
         self.fc1 = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=True)
@@ -54,8 +73,8 @@ class SiglipEncoderLayer(nn.Module):
     def __init__(self, cfg: SiglipConfig):
         self.self_attn = SiglipAttention(cfg)
         self.mlp = SiglipMLP(cfg)
-        self.layer_norm1 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
-        self.layer_norm2 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
+        self.layer_norm1 = LayerNormF32(cfg.hidden_size, eps=cfg.layer_norm_eps)
+        self.layer_norm2 = LayerNormF32(cfg.hidden_size, eps=cfg.layer_norm_eps)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.self_attn(self.layer_norm1(x))
@@ -74,7 +93,7 @@ class SiglipVisionTower(nn.Module):
         self.layers = nn.ModuleList(
             [SiglipEncoderLayer(cfg) for _ in range(cfg.num_hidden_layers)]
         )
-        self.post_layernorm = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
+        self.post_layernorm = LayerNormF32(cfg.hidden_size, eps=cfg.layer_norm_eps)
         # PaliGemma multi-modal projector：vision hidden -> gemma width
         self.multi_modal_projector = nn.Linear(cfg.hidden_size, cfg.projection_dim, bias=True)
 

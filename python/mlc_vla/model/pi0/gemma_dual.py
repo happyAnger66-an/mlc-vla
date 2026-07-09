@@ -94,10 +94,11 @@ def _gated_residual(x: Tensor, y: Tensor, gate: Optional[Tensor]) -> Tensor:
     return x + y * gate
 
 
-def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int) -> Tensor:
-    """全注意力 SDPA（M1 无 mask：prefix 内全可见 / suffix 可见 prefix+全 suffix）。
+def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int, add_mask: Optional[Tensor] = None) -> Tensor:
+    """全注意力 SDPA，可选加性 mask（padded key 列 -> -inf）。
 
     q: [B,n,Tq,H]（已含 1/sqrt(H) 缩放，fp32）；kc/vc: [B,kv,Ts,H]。
+    ``add_mask``：可选加性 mask，形状可广播到 [B,n,Tq,Ts]（如 [1,1,1,Ts]），fp32。
     logits 用 fp32 累加，probs 回到 vc.dtype 再与 vc 相乘（对齐 M0 / openpi）。
     返回 encoded [B,Tq,n*H]。
     """
@@ -111,6 +112,8 @@ def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int) -> Tensor:
         vc = op.broadcast_to(vc, (b, num_heads, ts, hd))
     kt = op.permute_dims(kc, [0, 1, 3, 2])  # [B,n,H,Ts]
     logits = op.matmul(q.astype("float32"), kt.astype("float32"))  # [B,n,Tq,Ts]
+    if add_mask is not None:
+        logits = logits + add_mask.astype("float32")
     probs = op.softmax(logits, axis=-1).astype(vc.dtype)
     encoded = op.matmul(probs, vc)  # [B,n,Tq,H]
     encoded = op.permute_dims(encoded, [0, 2, 1, 3])  # [B,Tq,n,H]
@@ -226,10 +229,11 @@ class DualExpertAttention(nn.Module):
         return outs
 
     # ---------- M1：KV 固化 / suffix-only 解码 ----------
-    def attn_prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor):
+    def attn_prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor, add_mask: Optional[Tensor] = None):
         """expert-0 对 prefix 自注意力，返回 (o_proj 输出, 缓存 K, 缓存 V)。
 
         缓存 K 为 **post-rope fp32**（保精度，与 M0 一致）；V 为模型 dtype。布局 [B,kv,S,H]。
+        ``add_mask``：可选 [1,1,1,Sp] 加性 mask，屏蔽 padded prefix 列（对齐 openpi 的 pad mask）。
         """
         proj = self.experts[0]
         n, kv, hd = self.num_heads, self.num_kv_heads, self.head_dim
@@ -241,13 +245,15 @@ class DualExpertAttention(nn.Module):
         qp = op.permute_dims(q, [0, 2, 1, 3])
         kp = op.permute_dims(k, [0, 2, 1, 3])  # [B,kv,S,H] fp32
         vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,S,H]
-        encoded = _sdpa(qp, kp, vp, n)
+        encoded = _sdpa(qp, kp, vp, n, add_mask=add_mask)
         return proj.o_proj(encoded), kp, vp
 
-    def attn_decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor) -> Tensor:
+    def attn_decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor,
+                       add_mask: Optional[Tensor] = None) -> Tensor:
         """expert-1 对 suffix 前向，attend 到 [prefix_kv; suffix_kv]。
 
         pk: [B,kv,Sp,H] fp32（post-rope prefix K）；pv: [B,kv,Sp,H] 模型 dtype。
+        ``add_mask``：可选 [1,1,1,Sp+t] 加性 mask（prefix 段屏蔽 padding，suffix 段全 0）。
         """
         proj = self.experts[1]
         n, kv, hd = self.num_heads, self.num_kv_heads, self.head_dim
@@ -261,7 +267,7 @@ class DualExpertAttention(nn.Module):
         vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,t,H]
         kfull = op.concat([pk, kp], dim=2)  # [B,kv,Sp+t,H] fp32
         vfull = op.concat([pv, vp], dim=2)  # [B,kv,Sp+t,H]
-        encoded = _sdpa(qp, kfull, vfull, n)
+        encoded = _sdpa(qp, kfull, vfull, n, add_mask=add_mask)
         return proj.o_proj(encoded)
 
 
@@ -320,19 +326,20 @@ class DualExpertBlock(nn.Module):
         return xs
 
     # ---------- M1 ----------
-    def prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor):
+    def prefill_e0(self, x: Tensor, cos: Tensor, sin: Tensor, add_mask: Optional[Tensor] = None):
         """expert-0 单层 prefill：返回 (层输出, 该层缓存 K, 缓存 V)。"""
         normed, _ = self.input_layernorm[0](x, None)
-        attn_out, k, v = self.self_attn.attn_prefill_e0(normed, cos, sin)
+        attn_out, k, v = self.self_attn.attn_prefill_e0(normed, cos, sin, add_mask=add_mask)
         x = x + attn_out
         normed2, _ = self.post_attention_layernorm[0](x, None)
         x = x + self.mlp[0](normed2)
         return x, k, v
 
-    def decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor, cond: Optional[Tensor]) -> Tensor:
+    def decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor,
+                  cond: Optional[Tensor], add_mask: Optional[Tensor] = None) -> Tensor:
         """expert-1 单层 decode：用外部 prefix K/V。"""
         normed, gate = self.input_layernorm[1](x, cond)
-        attn_out = self.self_attn.attn_decode_e1(normed, cos, sin, pk, pv)
+        attn_out = self.self_attn.attn_decode_e1(normed, cos, sin, pk, pv, add_mask=add_mask)
         x = _gated_residual(x, attn_out, gate)
         normed2, gate2 = self.post_attention_layernorm[1](x, cond)
         x = _gated_residual(x, self.mlp[1](normed2), gate2)
@@ -381,17 +388,19 @@ class DualExpertGemma(nn.Module):
         )
 
     # ---------- M1：prefix 固化 + suffix-only 解码 ----------
-    def prefill_prefix(self, prefix_emb: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+    def prefill_prefix(self, prefix_emb: Tensor, cos: Tensor, sin: Tensor,
+                       add_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """expert-0 跑完 prefix，逐层缓存 K/V。
 
         返回 (keys, values)，形状均 [depth, B, kv, Sp, H]（keys fp32，values 模型 dtype）。
         prefix hidden 输出（经 final_norm）去噪时不再使用，故此处不算。
+        ``add_mask``：可选 [1,1,1,Sp] 加性 mask，屏蔽 padded prefix 列。
         """
         x = prefix_emb
         ks: List[Tensor] = []  # noqa: UP006
         vs: List[Tensor] = []  # noqa: UP006
         for layer in self.layers:
-            x, k, v = layer.prefill_e0(x, cos, sin)  # k,v: [B,kv,Sp,H]
+            x, k, v = layer.prefill_e0(x, cos, sin, add_mask=add_mask)  # k,v: [B,kv,Sp,H]
             ks.append(op.reshape(k, [1, *k.shape]))
             vs.append(op.reshape(v, [1, *v.shape]))
         keys = op.concat(ks, dim=0) if len(ks) > 1 else ks[0]
@@ -400,15 +409,18 @@ class DualExpertGemma(nn.Module):
 
     def decode_suffix(
         self, suffix_emb: Tensor, keys: Tensor, values: Tensor, cos: Tensor, sin: Tensor,
-        adarms_cond: Optional[Tensor],
+        adarms_cond: Optional[Tensor], add_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """expert-1 跑完 suffix，使用外部 prefix K/V。返回末端 norm 后的 suffix 隐状态。"""
+        """expert-1 跑完 suffix，使用外部 prefix K/V。返回末端 norm 后的 suffix 隐状态。
+
+        ``add_mask``：可选 [1,1,1,Sp+t] 加性 mask（prefix 段屏蔽 padding，suffix 段全 0）。
+        """
         x = suffix_emb
         k_list = list(op.split(keys, self.depth, axis=0)) if self.depth > 1 else [keys]
         v_list = list(op.split(values, self.depth, axis=0)) if self.depth > 1 else [values]
         for i, layer in enumerate(self.layers):
             pk = op.squeeze(k_list[i], axis=0)  # [B,kv,Sp,H]
             pv = op.squeeze(v_list[i], axis=0)
-            x = layer.decode_e1(x, cos, sin, pk, pv, adarms_cond)
+            x = layer.decode_e1(x, cos, sin, pk, pv, adarms_cond, add_mask=add_mask)
         normed, _ = self.final_norm[1](x, adarms_cond)
         return normed

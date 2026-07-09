@@ -41,24 +41,51 @@ def _build_additive_mask(prefix_len: int, suffix_len: int, neg_inf: float, dtype
     return mask.reshape(1, 1, total, total)
 
 
+_ALL_STAGES = ("vision", "embed", "backbone")
+
+
+def include_for(functions) -> set[str]:
+    """按导出函数推断需要构建的子模块（分段编译：每个 engine 只携带自身权重）。"""
+    if functions is None:
+        return set(_ALL_STAGES)
+    need: set[str] = set()
+    for f in functions:
+        if f == "embed_image":
+            need.add("vision")
+        elif f == "embed_language":
+            need.add("embed")
+        elif f in ("denoise_step", "prefill", "denoise_step_kv"):
+            need.add("backbone")
+    return need or set(_ALL_STAGES)
+
+
 class Pi0Model(nn.Module):
-    def __init__(self, config: Pi0Config):
+    def __init__(self, config: Pi0Config, include: set[str] | None = None):
+        """``include``：仅构建指定子模块（``vision`` / ``embed`` / ``backbone``）。
+
+        默认构建全部（向后兼容）。分段编译时按需只建一部分，使 ``export_tvm`` 的 packed
+        参数只含该 stage 自身权重（否则每个 engine 会打包整模 775 个参数）。
+        """
         self.config = config
         vlm = config.vlm
         ae = config.action_expert
+        include = set(_ALL_STAGES) if include is None else set(include)
+        self._include = include
 
         self.dtype = config.dtype
-        self.vision = SiglipVisionTower(config.siglip)
-        self.embed_tokens = nn.Embedding(PALIGEMMA_VOCAB_SIZE := 257_152, vlm.width)
-        self.vocab_size = PALIGEMMA_VOCAB_SIZE
-        self.backbone = DualExpertGemma(config)
-
-        # 动作头
-        self.action_in_proj = nn.Linear(config.action_dim, ae.width, bias=True)
-        self.action_out_proj = nn.Linear(ae.width, config.action_dim, bias=True)
-        # π0.5 time MLP（产生 adaRMS 条件）
-        self.time_mlp_in = nn.Linear(ae.width, ae.width, bias=True)
-        self.time_mlp_out = nn.Linear(ae.width, ae.width, bias=True)
+        if "vision" in include:
+            self.vision = SiglipVisionTower(config.siglip)
+        if "embed" in include:
+            self.embed_tokens = nn.Embedding(PALIGEMMA_VOCAB_SIZE := 257_152, vlm.width)
+            self.vocab_size = PALIGEMMA_VOCAB_SIZE
+        if "backbone" in include:
+            self.backbone = DualExpertGemma(config)
+            # 动作头
+            self.action_in_proj = nn.Linear(config.action_dim, ae.width, bias=True)
+            self.action_out_proj = nn.Linear(ae.width, config.action_dim, bias=True)
+            # π0.5 time MLP（产生 adaRMS 条件）
+            self.time_mlp_in = nn.Linear(ae.width, ae.width, bias=True)
+            self.time_mlp_out = nn.Linear(ae.width, ae.width, bias=True)
 
         self._vlm_width = vlm.width
         self._ae_width = ae.width
@@ -98,23 +125,40 @@ class Pi0Model(nn.Module):
         return v_t.astype("float32")
 
     # ---------- M1：prefix 固化 + suffix-only 去噪 ----------
-    def prefill(self, prefix_embs: Tensor):
+    def prefill(self, prefix_embs: Tensor, prefix_mask: Tensor):
         """expert-0 对 prefix 跑一次，返回逐层缓存 (keys, values)。
 
-        keys/values 形状 [depth, 1, kv, prefix_len, head_dim]（keys fp32，values 模型 dtype）。
+        - ``prefix_mask``：[1,1,1,prefix_len] 加性 mask（0=有效，-inf=padding），屏蔽 padded
+          prefix 列，使有效 token 的 K/V 与 openpi（带 pad mask 的 prefill）一致。全 0 时退化为
+          M1 无 padding 语义。
+        - keys/values 形状 [depth, 1, kv, prefix_len, head_dim]（keys fp32，values 模型 dtype）。
         """
         cos, sin = self.backbone.make_rope_tables(self.config.prefix_len, offset=0)
-        keys, values = self.backbone.prefill_prefix(prefix_embs.astype(self.dtype), cos, sin)
+        keys, values = self.backbone.prefill_prefix(
+            prefix_embs.astype(self.dtype), cos, sin, add_mask=prefix_mask
+        )
         return keys, values
 
-    def denoise_step_kv(self, keys: Tensor, values: Tensor, x_t: Tensor, time_emb: Tensor) -> Tensor:
-        """suffix-only 去噪：expert-1 用外部 prefix K/V，返回 v_t [1,horizon,action_dim]。"""
+    def denoise_step_kv(
+        self, keys: Tensor, values: Tensor, x_t: Tensor, time_emb: Tensor,
+        suffix_cos: Tensor, suffix_sin: Tensor, prefix_mask: Tensor,
+    ) -> Tensor:
+        """suffix-only 去噪：expert-1 用外部 prefix K/V，返回 v_t [1,horizon,action_dim]。
+
+        - ``suffix_cos``/``suffix_sin``：[1,suffix_len,1,head_dim//2] fp32，宿主按 suffix 位置
+          （openpi：``sum(prefix_pad)`` + arange(suffix_len)）预算的 RoPE 表。padding 会改变有效
+          prefix 长度，故 suffix RoPE offset 由宿主传入而非编译期 bake。
+        - ``prefix_mask``：[1,1,1,prefix_len] 加性 mask，屏蔽 padded prefix 列。
+        """
         cfg = self.config
-        # suffix 的 RoPE 位置从 prefix_len 起（对齐 openpi 的 position_ids 续接）
-        cos, sin = self.backbone.make_rope_tables(cfg.suffix_len, offset=cfg.prefix_len)
         suffix_emb = self.action_in_proj(x_t).astype(self.dtype)
         adarms_cond = self._time_cond(time_emb)
-        out = self.backbone.decode_suffix(suffix_emb, keys, values, cos, sin, adarms_cond)
+        # 拼出 suffix 对 [prefix; suffix] 的完整加性 mask：prefix 段用 pad mask，suffix 段全 0
+        zeros_suffix = nn.Tensor.from_const(np.zeros((1, 1, 1, cfg.suffix_len), "float32"))
+        full_mask = op.concat([prefix_mask, zeros_suffix], dim=-1)  # [1,1,1,prefix_len+suffix_len]
+        out = self.backbone.decode_suffix(
+            suffix_emb, keys, values, suffix_cos, suffix_sin, adarms_cond, add_mask=full_mask
+        )
         v_t = self.action_out_proj(out)
         return v_t.astype("float32")
 

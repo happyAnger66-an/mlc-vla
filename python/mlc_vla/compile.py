@@ -18,15 +18,17 @@ import argparse
 import numpy as np
 
 from mlc_vla.model.pi0 import Pi0Config, Pi0Model
+from mlc_vla.model.pi0.pi0_model import include_for
 
 
 def build_irmodule(config: Pi0Config, functions=None):
     """实例化模型并导出 relax IRModule + 参数规格。
 
-    ``functions``：可选子函数列表（如 ``["denoise_step"]``）。bf16 编译时建议只导出
-    ``denoise_step`` 以绕开 SigLIP 的 layer_norm（TVM 暂不支持 bf16 layer_norm）。
+    ``functions``：可选子函数列表（如 ``["denoise_step"]``）。分段编译时只构建该 stage 需要
+    的子模块（vision/embed/backbone），使每个 engine 只携带自身权重。SigLIP 的 bf16 layer_norm
+    已由 ``LayerNormF32`` 内部 fp32 计算解决。
     """
-    model = Pi0Model(config)
+    model = Pi0Model(config, include=include_for(functions))
     # 把参数 dtype 统一到 config.dtype（fp16/bf16 省显存；默认 fp32 时为 no-op）
     model.to(config.dtype)
     mod, named_params, ext_mods = model.export_tvm(
