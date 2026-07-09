@@ -65,14 +65,21 @@ def run(config: Pi0Config, target: str, loop_steps: int = 0):
         rng.standard_normal((1, config.action_expert.width)).astype(dt), dev
     )
 
+    # M1 辅助输入：全有效 prefix mask + suffix RoPE offset=prefix_len（复刻 M0 baked 语义）
+    from mlc_vla.sample import make_prefix_mask_np, make_rope_np
+
+    pmask = tvm.runtime.tensor(make_prefix_mask_np(config.prefix_len), dev)
+    _c, _s = make_rope_np(config.suffix_len, config.vlm.head_dim, config.rope_theta, offset=config.prefix_len)
+    scos, ssin = tvm.runtime.tensor(_c, dev), tvm.runtime.tensor(_s, dev)
+
     # M0：联合 denoise
     v0 = vm["denoise_step"](prefix, x_t, time_emb, params)
     v0 = (v0.numpy() if hasattr(v0, "numpy") else v0[0].numpy())
 
     # M1：prefill 固化 -> suffix-only denoise
-    kv = _unpack(vm["prefill"](prefix, params))
+    kv = _unpack(vm["prefill"](prefix, pmask, params))
     keys, values = kv[0], kv[1]
-    v1 = vm["denoise_step_kv"](keys, values, x_t, time_emb, params)
+    v1 = vm["denoise_step_kv"](keys, values, x_t, time_emb, scos, ssin, pmask, params)
     v1 = (v1.numpy() if hasattr(v1, "numpy") else v1[0].numpy())
 
     cos = _cosine(v0, v1)
@@ -95,7 +102,7 @@ def run(config: Pi0Config, target: str, loop_steps: int = 0):
 
         def m1_step(x_np, i):
             xd = tvm.runtime.tensor(x_np.astype(dt), dev)
-            r = vm["denoise_step_kv"](keys, values, xd, te_dev[i], params)
+            r = vm["denoise_step_kv"](keys, values, xd, te_dev[i], scos, ssin, pmask, params)
             return (r.numpy() if hasattr(r, "numpy") else r[0].numpy())
 
         a0 = euler_loop(m0_step, noise, loop_steps)

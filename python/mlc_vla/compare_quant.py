@@ -47,18 +47,26 @@ def _random_src(fp_np, seed: int) -> dict:
     return src
 
 
-def _run_kv(ex, named_params, params_dict, prefix, x_t, time_emb, dt, dev):
+def _run_kv(ex, named_params, params_dict, prefix, x_t, time_emb, dt, dev, config):
     import tvm
     from tvm import relax
 
+    from mlc_vla.sample import make_prefix_mask_np, make_rope_np
+
     vm = relax.VirtualMachine(ex, dev)
     tp = [tvm.runtime.tensor(params_dict[name], dev) for name, _ in named_params]
-    kv = _unpack(vm["prefill"](tvm.runtime.tensor(prefix.astype(dt), dev), tp))
+    prefix_mask = tvm.runtime.tensor(make_prefix_mask_np(config.prefix_len), dev)
+    cos_np, sin_np = make_rope_np(config.suffix_len, config.vlm.head_dim, config.rope_theta,
+                                  offset=config.prefix_len)
+    suffix_cos = tvm.runtime.tensor(cos_np, dev)
+    suffix_sin = tvm.runtime.tensor(sin_np, dev)
+    kv = _unpack(vm["prefill"](tvm.runtime.tensor(prefix.astype(dt), dev), prefix_mask, tp))
     keys, values = kv[0], kv[1]
     v = vm["denoise_step_kv"](
         keys, values,
         tvm.runtime.tensor(x_t.astype(dt), dev),
         tvm.runtime.tensor(time_emb.astype(dt), dev),
+        suffix_cos, suffix_sin, prefix_mask,
         tp,
     )
     out = v.numpy() if hasattr(v, "numpy") else v[0].numpy()
@@ -87,14 +95,14 @@ def run(config: Pi0Config, target: str, quant_name: str, seed: int, ckpt: str | 
     # ---- fp 路径 ----
     ex_fp, np_fp = compile_model(config, target, functions=_FUNCS)
     fp_params = {name: src_fp[name].astype(p.dtype) for name, p in np_fp}
-    v_fp = _run_kv(ex_fp, np_fp, fp_params, prefix, x_t, time_emb, dt, dev)
+    v_fp = _run_kv(ex_fp, np_fp, fp_params, prefix, x_t, time_emb, dt, dev, config)
     del ex_fp
     gc.collect()
 
     # ---- 量化路径 ----
     ex_q, np_q, qmap, quant = compile_model_quant(config, target, _FUNCS, quant_name)
     q_params = quantize_params(quant, src_fp, np_q, qmap, dev)
-    v_q = _run_kv(ex_q, np_q, q_params, prefix, x_t, time_emb, dt, dev)
+    v_q = _run_kv(ex_q, np_q, q_params, prefix, x_t, time_emb, dt, dev, config)
 
     # ---- 字节数对比 ----
     fp_bytes = sum(a.nbytes for a in fp_params.values())

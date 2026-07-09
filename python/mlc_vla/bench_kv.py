@@ -27,6 +27,18 @@ def _unpack(ret):
     return [ret[i] for i in range(len(ret))]
 
 
+def _kv_aux(config, dev):
+    """prefill/denoise_step_kv 的辅助输入：prefix_mask(全有效) + suffix RoPE(offset=prefix_len)。"""
+    import tvm
+
+    from mlc_vla.sample import make_prefix_mask_np, make_rope_np
+
+    prefix_mask = tvm.runtime.tensor(make_prefix_mask_np(config.prefix_len), dev)
+    cos_np, sin_np = make_rope_np(config.suffix_len, config.vlm.head_dim, config.rope_theta,
+                                  offset=config.prefix_len)
+    return prefix_mask, tvm.runtime.tensor(cos_np, dev), tvm.runtime.tensor(sin_np, dev)
+
+
 def _bench(fn, iters: int, sync) -> float:
     for _ in range(3):  # warmup
         fn()
@@ -63,10 +75,11 @@ def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool
     time_emb = tvm.runtime.tensor(
         rng.standard_normal((1, config.action_expert.width)).astype(dt), dev)
 
-    keys, values = _unpack(vm["prefill"](prefix, params))
+    pmask, scos, ssin = _kv_aux(config, dev)
+    keys, values = _unpack(vm["prefill"](prefix, pmask, params))
 
-    t_prefill = _bench(lambda: vm["prefill"](prefix, params), iters, sync)
-    t_m1 = _bench(lambda: vm["denoise_step_kv"](keys, values, x_t, time_emb, params), iters, sync)
+    t_prefill = _bench(lambda: vm["prefill"](prefix, pmask, params), iters, sync)
+    t_m1 = _bench(lambda: vm["denoise_step_kv"](keys, values, x_t, time_emb, scos, ssin, pmask, params), iters, sync)
     t_m0 = _bench(lambda: vm["denoise_step"](prefix, x_t, time_emb, params), iters, sync)
 
     total_m1 = t_prefill + steps * t_m1
@@ -110,10 +123,11 @@ def run_quant(config: Pi0Config, target: str, quant_name: str, steps: int, iters
     prefix = tvm.runtime.tensor(rng.standard_normal((1, config.prefix_len, config.vlm.width)).astype(dt), dev)
     x_t = tvm.runtime.tensor(rng.standard_normal((1, config.action_horizon, config.action_dim)).astype(dt), dev)
     time_emb = tvm.runtime.tensor(rng.standard_normal((1, config.action_expert.width)).astype(dt), dev)
-    keys, values = _unpack(vm["prefill"](prefix, params))
+    pmask, scos, ssin = _kv_aux(config, dev)
+    keys, values = _unpack(vm["prefill"](prefix, pmask, params))
 
-    t_prefill = _bench(lambda: vm["prefill"](prefix, params), iters, sync)
-    t_step = _bench(lambda: vm["denoise_step_kv"](keys, values, x_t, time_emb, params), iters, sync)
+    t_prefill = _bench(lambda: vm["prefill"](prefix, pmask, params), iters, sync)
+    t_step = _bench(lambda: vm["denoise_step_kv"](keys, values, x_t, time_emb, scos, ssin, pmask, params), iters, sync)
     print(f"[bench-quant] quant={quant_name} param bytes={q_bytes/1e6:.1f}MB")
     print(f"[bench-quant] prefill            : {t_prefill:8.3f} ms")
     print(f"[bench-quant] denoise_step_kv    : {t_step:8.3f} ms/step")

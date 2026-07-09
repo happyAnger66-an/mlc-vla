@@ -215,18 +215,28 @@ def _run_tvm_kv(config, params, prefix, x_t, time_emb, target):
 
     from mlc_vla.compile import compile_model
 
+    from mlc_vla.sample import make_prefix_mask_np, make_rope_np
+
     ex, named_params = compile_model(config, target, functions=_KV_FUNCS)
     dev = tvm.cpu(0) if target in ("llvm", "c") else tvm.device(target, 0)
     vm = relax.VirtualMachine(ex, dev)
     dt = config.dtype
     tvm_params = [tvm.runtime.tensor(params[name], dev) for name, _ in named_params]
 
-    kv = vm["prefill"](tvm.runtime.tensor(prefix.astype(dt), dev), tvm_params)
+    # 对拍用全有效 prefix + suffix RoPE offset=prefix_len（复刻旧 bake 语义）
+    prefix_mask = tvm.runtime.tensor(make_prefix_mask_np(config.prefix_len), dev)
+    cos_np, sin_np = make_rope_np(config.suffix_len, config.vlm.head_dim, config.rope_theta,
+                                  offset=config.prefix_len)
+    suffix_cos = tvm.runtime.tensor(cos_np, dev)
+    suffix_sin = tvm.runtime.tensor(sin_np, dev)
+
+    kv = vm["prefill"](tvm.runtime.tensor(prefix.astype(dt), dev), prefix_mask, tvm_params)
     keys, values = (kv[0], kv[1]) if not hasattr(kv, "numpy") else (kv, kv)
     v = vm["denoise_step_kv"](
         keys, values,
         tvm.runtime.tensor(x_t.astype(dt), dev),
         tvm.runtime.tensor(time_emb.astype(dt), dev),
+        suffix_cos, suffix_sin, prefix_mask,
         tvm_params,
     )
     out = v.numpy() if hasattr(v, "numpy") else v[0].numpy()

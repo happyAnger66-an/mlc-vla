@@ -174,6 +174,10 @@ class Pi0Model(nn.Module):
         vlm = cfg.vlm
         kv, hd, depth = vlm.num_kv_heads, vlm.head_dim, vlm.depth
         kv_shape = [depth, 1, kv, cfg.prefix_len, hd]
+        # prefix 加性 mask（0=有效 / -inf=padding），广播到 [B,heads,Tq,prefix_len]
+        prefix_mask_shape = [1, 1, 1, cfg.prefix_len]
+        # 宿主预算的 suffix RoPE 表（offset=有效 prefix 长度）
+        rope_shape = [1, cfg.suffix_len, 1, hd // 2]
         mod_spec = {
             "embed_image": {
                 "image": nn.spec.Tensor([1, s.image_size, s.image_size, s.num_channels], self.dtype),
@@ -191,6 +195,7 @@ class Pi0Model(nn.Module):
             },
             "prefill": {
                 "prefix_embs": nn.spec.Tensor([1, cfg.prefix_len, self._vlm_width], self.dtype),
+                "prefix_mask": nn.spec.Tensor(prefix_mask_shape, "float32"),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
             "denoise_step_kv": {
@@ -198,6 +203,9 @@ class Pi0Model(nn.Module):
                 "values": nn.spec.Tensor(kv_shape, self.dtype),
                 "x_t": nn.spec.Tensor([1, cfg.action_horizon, cfg.action_dim], self.dtype),
                 "time_emb": nn.spec.Tensor([1, self._ae_width], self.dtype),
+                "suffix_cos": nn.spec.Tensor(rope_shape, "float32"),
+                "suffix_sin": nn.spec.Tensor(rope_shape, "float32"),
+                "prefix_mask": nn.spec.Tensor(prefix_mask_shape, "float32"),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
         }

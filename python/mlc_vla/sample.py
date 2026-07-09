@@ -35,6 +35,35 @@ def make_time_embs(num_steps: int, ae_width: int) -> list[np.ndarray]:
     return embs
 
 
+def make_rope_np(num_positions: int, head_dim: int, theta: float, offset: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """宿主侧 RoPE cos/sin 表 [1, num_positions, 1, head_dim//2] fp32（与 gemma_dual._rope_tables 一致）。"""
+    half = head_dim // 2
+    positions = np.arange(offset, offset + num_positions, dtype=np.float64)
+    freq_exponents = (2.0 / head_dim) * np.arange(half, dtype=np.float64)
+    timescale = theta**freq_exponents
+    radians = positions[:, None] / timescale[None, :]
+    cos = np.cos(radians).reshape(1, num_positions, 1, half).astype("float32")
+    sin = np.sin(radians).reshape(1, num_positions, 1, half).astype("float32")
+    return cos, sin
+
+
+def make_prefix_mask_np(prefix_len: int, num_valid: int | None = None,
+                        pad_mask: np.ndarray | None = None, neg: float = -1e9) -> np.ndarray:
+    """构造 prefix 加性 mask [1,1,1,prefix_len]（0=有效，neg=padding）。
+
+    ``pad_mask``（[prefix_len] 或 [1,prefix_len] 布尔/0-1）优先；否则用 ``num_valid`` 表示前
+    ``num_valid`` 个 token 有效（右侧 padding）。二者都不给则全有效。
+    """
+    valid = np.ones((prefix_len,), dtype=np.float32)
+    if pad_mask is not None:
+        valid = np.asarray(pad_mask, dtype=np.float32).reshape(-1)[:prefix_len]
+    elif num_valid is not None:
+        valid = np.zeros((prefix_len,), dtype=np.float32)
+        valid[: int(num_valid)] = 1.0
+    add = np.where(valid > 0, 0.0, neg).astype("float32")
+    return add.reshape(1, 1, 1, prefix_len)
+
+
 def euler_loop(step_fn, x0: np.ndarray, num_steps: int) -> np.ndarray:
     """给定每步速度回调 step_fn(x_t[np], step_idx)->v_t[np]，跑 Euler 积分。"""
     dt = -1.0 / num_steps
@@ -69,13 +98,31 @@ class PiZeroRunner:
         return [ret[i] for i in range(len(ret))]
 
     def sample(self, params, prefix_embs: np.ndarray, noise: np.ndarray | None = None,
-               num_steps: int = 10, seed: int = 0) -> np.ndarray:
+               num_steps: int = 10, seed: int = 0,
+               prefix_pad: np.ndarray | None = None) -> np.ndarray:
+        """宿主去噪环。
+
+        ``prefix_pad``：[prefix_len] 布尔/0-1 有效位（openpi prefix_pad_masks）。None=全有效。
+        suffix RoPE offset 取有效 prefix 长度（对齐 openpi ``sum(prefix_pad)``）。
+        """
         cfg = self.config
         tvm = self._tvm
         dt = cfg.dtype
 
+        # prefix pad mask（加性）+ suffix RoPE 表（offset=有效 prefix 长度）
+        if prefix_pad is None:
+            num_valid = cfg.prefix_len
+            prefix_mask_np = make_prefix_mask_np(cfg.prefix_len)
+        else:
+            num_valid = int(np.asarray(prefix_pad).reshape(-1).sum())
+            prefix_mask_np = make_prefix_mask_np(cfg.prefix_len, pad_mask=prefix_pad)
+        prefix_mask = tvm.runtime.tensor(prefix_mask_np, self.dev)
+        cos_np, sin_np = make_rope_np(cfg.suffix_len, cfg.vlm.head_dim, cfg.rope_theta, offset=num_valid)
+        suffix_cos = tvm.runtime.tensor(cos_np, self.dev)
+        suffix_sin = tvm.runtime.tensor(sin_np, self.dev)
+
         prefix_dev = tvm.runtime.tensor(prefix_embs.astype(dt), self.dev)
-        kv = self._unpack(self.vm["prefill"](prefix_dev, params))
+        kv = self._unpack(self.vm["prefill"](prefix_dev, prefix_mask, params))
         keys, values = kv[0], kv[1]
 
         if noise is None:
@@ -86,7 +133,9 @@ class PiZeroRunner:
 
         def step_fn(x_np, i):
             x_dev = tvm.runtime.tensor(x_np.astype(dt), self.dev)
-            v = self.vm["denoise_step_kv"](keys, values, x_dev, te_dev[i], params)
+            v = self.vm["denoise_step_kv"](
+                keys, values, x_dev, te_dev[i], suffix_cos, suffix_sin, prefix_mask, params
+            )
             return (v.numpy() if hasattr(v, "numpy") else v[0].numpy())
 
         return euler_loop(step_fn, noise, num_steps)
