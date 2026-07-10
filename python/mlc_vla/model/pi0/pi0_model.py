@@ -54,7 +54,7 @@ def include_for(functions) -> set[str]:
             need.add("vision")
         elif f == "embed_language":
             need.add("embed")
-        elif f in ("denoise_step", "prefill", "denoise_step_kv"):
+        elif f in ("denoise_step", "prefill", "denoise_step_kv", "denoise_loop_kv"):
             need.add("backbone")
     return need or set(_ALL_STAGES)
 
@@ -162,6 +162,37 @@ class Pi0Model(nn.Module):
         v_t = self.action_out_proj(out)
         return v_t.astype("float32")
 
+    def denoise_loop_kv(
+        self, keys: Tensor, values: Tensor, x0: Tensor, time_embs: Tensor,
+        suffix_cos: Tensor, suffix_sin: Tensor, prefix_mask: Tensor,
+    ) -> Tensor:
+        """图内整段去噪环：固定 ``num_denoise_steps`` 步 Euler 积分，返回最终动作。
+
+        把宿主侧的 Euler 环下沉进计算图，消除每步 host↔device 往返与（跨进程）IPC 开销，
+        便于整段 CUDA Graph 捕获。数值上与逐步调用 ``denoise_step_kv`` 一致（同算子、同 dtype）。
+
+        - ``x0``：初始噪声 [1,horizon,action_dim] fp32（积分在 fp32 累加，对齐 openpi）。
+        - ``time_embs``：[num_steps, ae_width]，第 i 行为第 i 步（t=1,1+dt,...）的正弦时间编码。
+        - 其余入参同 ``denoise_step_kv``（prefix K/V、suffix RoPE 表、prefix pad mask）。
+        """
+        cfg = self.config
+        n = cfg.num_denoise_steps
+        dt = -1.0 / n
+        zeros_suffix = nn.Tensor.from_const(np.zeros((1, 1, 1, cfg.suffix_len), "float32"))
+        full_mask = op.concat([prefix_mask, zeros_suffix], dim=-1)
+        te_list = list(op.split(time_embs, n, axis=0)) if n > 1 else [time_embs]
+
+        x = x0
+        for i in range(n):
+            suffix_emb = self.action_in_proj(x.astype(self.dtype)).astype(self.dtype)
+            adarms_cond = self._time_cond(te_list[i])  # [1, ae_width]
+            out = self.backbone.decode_suffix(
+                suffix_emb, keys, values, suffix_cos, suffix_sin, adarms_cond, add_mask=full_mask
+            )
+            v = self.action_out_proj(out).astype("float32")
+            x = x + dt * v
+        return x
+
     # ---------- 导出 spec ----------
     def get_default_spec(self, functions=None):
         """构造导出 spec。``functions`` 可选，仅导出指定子函数（如 ["denoise_step"]）。
@@ -203,6 +234,16 @@ class Pi0Model(nn.Module):
                 "values": nn.spec.Tensor(kv_shape, self.dtype),
                 "x_t": nn.spec.Tensor([1, cfg.action_horizon, cfg.action_dim], self.dtype),
                 "time_emb": nn.spec.Tensor([1, self._ae_width], self.dtype),
+                "suffix_cos": nn.spec.Tensor(rope_shape, "float32"),
+                "suffix_sin": nn.spec.Tensor(rope_shape, "float32"),
+                "prefix_mask": nn.spec.Tensor(prefix_mask_shape, "float32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "denoise_loop_kv": {
+                "keys": nn.spec.Tensor(kv_shape, "float32"),
+                "values": nn.spec.Tensor(kv_shape, self.dtype),
+                "x0": nn.spec.Tensor([1, cfg.action_horizon, cfg.action_dim], "float32"),
+                "time_embs": nn.spec.Tensor([cfg.num_denoise_steps, self._ae_width], self.dtype),
                 "suffix_cos": nn.spec.Tensor(rope_shape, "float32"),
                 "suffix_sin": nn.spec.Tensor(rope_shape, "float32"),
                 "prefix_mask": nn.spec.Tensor(prefix_mask_shape, "float32"),

@@ -21,7 +21,7 @@ from mlc_vla.compile import _device_for, compile_model
 from mlc_vla.model.pi0 import Pi0Config
 from mlc_vla.openpi_ref import sinusoidal_time_emb
 
-_KV_FUNCS = ["prefill", "denoise_step_kv"]
+_KV_FUNCS = ["prefill", "denoise_step_kv", "denoise_loop_kv"]
 
 
 def make_time_embs(num_steps: int, ae_width: int) -> list[np.ndarray]:
@@ -97,19 +97,15 @@ class PiZeroRunner:
             return [ret]
         return [ret[i] for i in range(len(ret))]
 
-    def sample(self, params, prefix_embs: np.ndarray, noise: np.ndarray | None = None,
-               num_steps: int = 10, seed: int = 0,
-               prefix_pad: np.ndarray | None = None) -> np.ndarray:
-        """宿主去噪环。
+    def _prepare(self, params, prefix_embs: np.ndarray, prefix_pad: np.ndarray | None):
+        """prefill 固化 K/V + 构造 prefix pad mask 与 suffix RoPE 表（device 常量）。
 
-        ``prefix_pad``：[prefix_len] 布尔/0-1 有效位（openpi prefix_pad_masks）。None=全有效。
-        suffix RoPE offset 取有效 prefix 长度（对齐 openpi ``sum(prefix_pad)``）。
+        返回 (keys, values, prefix_mask, suffix_cos, suffix_sin, num_valid)。
         """
         cfg = self.config
         tvm = self._tvm
         dt = cfg.dtype
 
-        # prefix pad mask（加性）+ suffix RoPE 表（offset=有效 prefix 长度）
         if prefix_pad is None:
             num_valid = cfg.prefix_len
             prefix_mask_np = make_prefix_mask_np(cfg.prefix_len)
@@ -124,10 +120,29 @@ class PiZeroRunner:
         prefix_dev = tvm.runtime.tensor(prefix_embs.astype(dt), self.dev)
         kv = self._unpack(self.vm["prefill"](prefix_dev, prefix_mask, params))
         keys, values = kv[0], kv[1]
+        return keys, values, prefix_mask, suffix_cos, suffix_sin, num_valid
 
+    def _noise(self, noise, seed):
+        cfg = self.config
         if noise is None:
             rng = np.random.default_rng(seed)
             noise = rng.standard_normal((1, cfg.action_horizon, cfg.action_dim)).astype(np.float32)
+        return noise.astype(np.float32)
+
+    def sample(self, params, prefix_embs: np.ndarray, noise: np.ndarray | None = None,
+               num_steps: int = 10, seed: int = 0,
+               prefix_pad: np.ndarray | None = None) -> np.ndarray:
+        """宿主去噪环（逐步调用 ``denoise_step_kv``，每步 host↔device 往返）。
+
+        ``prefix_pad``：[prefix_len] 布尔/0-1 有效位（openpi prefix_pad_masks）。None=全有效。
+        suffix RoPE offset 取有效 prefix 长度（对齐 openpi ``sum(prefix_pad)``）。
+        """
+        cfg = self.config
+        tvm = self._tvm
+        dt = cfg.dtype
+        keys, values, prefix_mask, suffix_cos, suffix_sin, _ = self._prepare(params, prefix_embs, prefix_pad)
+
+        noise = self._noise(noise, seed)
         time_embs = make_time_embs(num_steps, cfg.action_expert.width)
         te_dev = [tvm.runtime.tensor(te.astype(dt), self.dev) for te in time_embs]
 
@@ -139,3 +154,27 @@ class PiZeroRunner:
             return (v.numpy() if hasattr(v, "numpy") else v[0].numpy())
 
         return euler_loop(step_fn, noise, num_steps)
+
+    def sample_graph(self, params, prefix_embs: np.ndarray, noise: np.ndarray | None = None,
+                     seed: int = 0, prefix_pad: np.ndarray | None = None) -> np.ndarray:
+        """图内整段去噪环（``denoise_loop_kv``，单次调用跑完 N 步）。
+
+        步数固定为 ``config.num_denoise_steps``（编译期已知），一次调用完成全部 Euler 迭代，
+        消除每步 host↔device 往返与跨进程 IPC 开销，可整段 CUDA Graph 捕获。
+        """
+        cfg = self.config
+        tvm = self._tvm
+        dt = cfg.dtype
+        n = cfg.num_denoise_steps
+        keys, values, prefix_mask, suffix_cos, suffix_sin, _ = self._prepare(params, prefix_embs, prefix_pad)
+
+        noise = self._noise(noise, seed)
+        x0 = tvm.runtime.tensor(noise, self.dev)  # fp32
+        # time_embs 堆成 [num_steps, ae_width]，dtype 与模型一致（喂 time MLP）
+        time_embs = np.concatenate(make_time_embs(n, cfg.action_expert.width), axis=0).astype(dt)
+        te_dev = tvm.runtime.tensor(time_embs, self.dev)
+
+        out = self.vm["denoise_loop_kv"](
+            keys, values, x0, te_dev, suffix_cos, suffix_sin, prefix_mask, params
+        )
+        return out.numpy() if hasattr(out, "numpy") else out[0].numpy()
