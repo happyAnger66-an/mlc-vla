@@ -32,7 +32,8 @@ mlc-vla/
 ├── README.md                       # 本文件（项目入口）
 ├── docs/
 │   ├── arch.md                     # 架构设计（定位 / 模型拆解 / 复用矩阵 / 路线图）
-│   └── M0.md                       # M0 阶段落地细节与现状
+│   ├── M0.md                       # M0 阶段落地细节与现状
+│   └── M1.md                       # M1/M1+：prefix KV 固化 + suffix-only 去噪 + 端到端评测
 └── python/
     ├── pyproject.toml
     └── mlc_vla/
@@ -96,11 +97,14 @@ CUDA Graph / KV cache 复用 / bf16 / 调度优化留到后续阶段。
 
 ## 路线图
 
-- **M0**（进行中）：单步前向跑通 + 数值对齐 openpi。
-- **M1**：prefix KV 固化、suffix-only 解码路径；去噪循环整图化 + CUDA Graph。
-- **M2+**：bf16 / 混精、调度优化、实时控制 Engine 与端侧（Jetson Thor 等）部署。
+- **M0**（✅）：单步前向跑通 + 数值对齐 openpi。
+- **M1 / M1+**（✅）：prefix KV 固化、suffix-only 解码；host Euler 10 步 + 单步 CUDA Graph；
+  分段编译、bf16 LayerNorm 修复、prefix padding；Chameleon LIBERO 端到端评测。
+  TVM fp16 精度逼近 TRT（cosine 0.9988 / max_abs 0.079）。
+- **M2+**：去噪环整图化消除 host 往返、调度优化、量化、端侧（Jetson Thor 等）部署。
 
-完整设计与各阶段 DoD 见 [`docs/arch.md`](docs/arch.md)，M0 细节见 [`docs/M0.md`](docs/M0.md)。
+完整设计与各阶段 DoD 见 [`docs/arch.md`](docs/arch.md)，M0 细节见 [`docs/M0.md`](docs/M0.md)，
+M1/M1+ 与评测结论见 [`docs/M1.md`](docs/M1.md)。
 
 ---
 
