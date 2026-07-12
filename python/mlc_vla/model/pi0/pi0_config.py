@@ -95,6 +95,11 @@ class Pi0Config:
 
     # 数值
     dtype: str = "float32"  # M0 用 float32 便于 CPU 对拍；后续 phase 切 bf16
+    # 注意力 QK^T logits 的输入 dtype：
+    #   "float32"（默认，安全）——q/k 以 fp32 相乘（openpi 严格对齐，但走非 tensor-core sgemm，慢）
+    #   模型 dtype（如 "float16"）——q/k 降到 fp16 走 tensor-core，softmax 前仍以 fp32 累加输出，
+    #     与 TRT `_gemm_mha_v2` 同策略；prefill QK 显著提速，精度需过 compare gate。
+    attn_logits_dtype: str = "float32"
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10_000.0
     attn_neg_inf: float = -2.3819763e38  # 对齐 openpi big_neg

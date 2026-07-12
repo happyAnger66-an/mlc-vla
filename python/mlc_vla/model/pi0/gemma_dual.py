@@ -94,13 +94,15 @@ def _gated_residual(x: Tensor, y: Tensor, gate: Optional[Tensor]) -> Tensor:
     return x + y * gate
 
 
-def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int, add_mask: Optional[Tensor] = None) -> Tensor:
+def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int, add_mask: Optional[Tensor] = None,
+         logits_dtype: str = "float32") -> Tensor:
     """全注意力 SDPA，可选加性 mask（padded key 列 -> -inf）。
 
     q: [B,n,Tq,H]（已含 1/sqrt(H) 缩放，fp32）；kc/vc: [B,kv,Ts,H]。
     ``add_mask``：可选加性 mask，形状可广播到 [B,n,Tq,Ts]（如 [1,1,1,Ts]），fp32。
-    logits 用 fp32 累加，probs 回到 vc.dtype 再与 vc 相乘（对齐 M0 / openpi）。
-    返回 encoded [B,Tq,n*H]。
+    ``logits_dtype``：QK^T 输入 dtype——"float32" 走 sgemm（严格对齐 openpi）；模型 fp16 走
+    tensor-core（out_dtype 恒 fp32，softmax 前保持 fp32 累加，对齐 TRT）。
+    probs 回到 vc.dtype 再与 vc 相乘。返回 encoded [B,Tq,n*H]。
     """
     b = q.shape[0]
     hd = q.shape[3]
@@ -111,7 +113,7 @@ def _sdpa(q: Tensor, kc: Tensor, vc: Tensor, num_heads: int, add_mask: Optional[
         kc = op.broadcast_to(kc, (b, num_heads, ts, hd))
         vc = op.broadcast_to(vc, (b, num_heads, ts, hd))
     kt = op.permute_dims(kc, [0, 1, 3, 2])  # [B,n,H,Ts]
-    logits = op.matmul(q.astype("float32"), kt.astype("float32"))  # [B,n,Tq,Ts]
+    logits = op.matmul(q.astype(logits_dtype), kt.astype(logits_dtype), out_dtype="float32")
     if add_mask is not None:
         logits = logits + add_mask.astype("float32")
     probs = op.softmax(logits, axis=-1).astype(vc.dtype)
@@ -149,11 +151,12 @@ class _ExpertAttnProj(nn.Module):
 class DualExpertAttention(nn.Module):
     """双专家联合注意力：各专家独立 QKV 投影，拼接后做一次 attention。"""
 
-    def __init__(self, configs: List[GemmaExpertConfig]):  # noqa: UP006
+    def __init__(self, configs: List[GemmaExpertConfig], logits_dtype: str = "float32"):  # noqa: UP006
         self.configs = configs
         self.num_heads = configs[0].num_heads
         self.num_kv_heads = configs[0].num_kv_heads
         self.head_dim = configs[0].head_dim
+        self.logits_dtype = logits_dtype
         self.experts = nn.ModuleList([_ExpertAttnProj(c) for c in configs])
 
     def forward(
@@ -201,9 +204,10 @@ class DualExpertAttention(nn.Module):
             kc = op.broadcast_to(kc, (b, n, ts, hd))
             vc = op.broadcast_to(vc, (b, n, ts, hd))
 
-        # logits = q @ k^T，float32 累加，对齐 openpi
+        # logits = q @ k^T，fp32 累加（out_dtype 恒 fp32），输入 dtype 由 logits_dtype 决定
         kt = op.permute_dims(kc, [0, 1, 3, 2])  # [B,N,H,Ts]
-        logits = op.matmul(q.astype("float32"), kt.astype("float32"))  # [B,N,Tq,Ts]
+        logits = op.matmul(q.astype(self.logits_dtype), kt.astype(self.logits_dtype),
+                           out_dtype="float32")  # [B,N,Tq,Ts]
         logits = logits + attn_mask.astype("float32")
         probs = op.softmax(logits, axis=-1).astype(vc.dtype)
 
@@ -245,7 +249,7 @@ class DualExpertAttention(nn.Module):
         qp = op.permute_dims(q, [0, 2, 1, 3])
         kp = op.permute_dims(k, [0, 2, 1, 3])  # [B,kv,S,H] fp32
         vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,S,H]
-        encoded = _sdpa(qp, kp, vp, n, add_mask=add_mask)
+        encoded = _sdpa(qp, kp, vp, n, add_mask=add_mask, logits_dtype=self.logits_dtype)
         return proj.o_proj(encoded), kp, vp
 
     def attn_decode_e1(self, x: Tensor, cos: Tensor, sin: Tensor, pk: Tensor, pv: Tensor,
@@ -267,16 +271,17 @@ class DualExpertAttention(nn.Module):
         vp = op.permute_dims(v, [0, 2, 1, 3]).astype(x.dtype)  # [B,kv,t,H]
         kfull = op.concat([pk, kp], dim=2)  # [B,kv,Sp+t,H] fp32
         vfull = op.concat([pv, vp], dim=2)  # [B,kv,Sp+t,H]
-        encoded = _sdpa(qp, kfull, vfull, n, add_mask=add_mask)
+        encoded = _sdpa(qp, kfull, vfull, n, add_mask=add_mask, logits_dtype=self.logits_dtype)
         return proj.o_proj(encoded)
 
 
 class DualExpertBlock(nn.Module):
     """一层双专家 transformer block。"""
 
-    def __init__(self, configs: List[GemmaExpertConfig], eps: float, use_adarms: List[bool]):  # noqa: UP006
+    def __init__(self, configs: List[GemmaExpertConfig], eps: float, use_adarms: List[bool],  # noqa: UP006
+                 logits_dtype: str = "float32"):
         self.use_adarms = use_adarms
-        self.self_attn = DualExpertAttention(configs)
+        self.self_attn = DualExpertAttention(configs, logits_dtype=logits_dtype)
         self.mlp = nn.ModuleList([GemmaExpertMLP(c) for c in configs])
         self.input_layernorm = nn.ModuleList(
             [GemmaRMSNorm(c.width, eps, use_adarms[i], c.width) for i, c in enumerate(configs)]
@@ -356,8 +361,10 @@ class DualExpertGemma(nn.Module):
         # π0.5：expert-0 (PaliGemma) 普通 RMSNorm；expert-1 (action) 用 adaRMS
         self.use_adarms = [False, True] if config.pi05 else [False, False]
         self.depth = configs[0].depth
+        logits_dtype = getattr(config, "attn_logits_dtype", "float32")
         self.layers = nn.ModuleList(
-            [DualExpertBlock(configs, eps, self.use_adarms) for _ in range(self.depth)]
+            [DualExpertBlock(configs, eps, self.use_adarms, logits_dtype=logits_dtype)
+             for _ in range(self.depth)]
         )
         self.final_norm = nn.ModuleList(
             [GemmaRMSNorm(c.width, eps, self.use_adarms[i], c.width) for i, c in enumerate(configs)]
