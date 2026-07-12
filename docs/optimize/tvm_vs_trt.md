@@ -431,6 +431,84 @@ nsys stats -r cuda_gpu_kern_sum,cuda_api_sum output/pi05_libero_profile/nsys/tvm
 
 ---
 
+## 4.2 优化实现日志（逐步跟踪）
+
+> 每落地一步优化就补一条：**动机 / 原理 → 实现（pass 顺序 + 代码入口）→ 过程 → 结果 → 副作用**。
+> 便于回溯「为什么这么改、改了哪、量了多少」。状态：✅ 已落地 / 🚧 进行中 / ⬜ 计划。
+
+### [A] 证据补齐：nsys + trt-profile 定位靶心 ✅（2026-07-12）
+
+- **动机**：先证明差距在「算力/布局」还是「launch」，避免盲目上 CUDA Graph。
+- **原理**：GPU kernel 时长排序（`cuda_gpu_kern_sum`）判断是否 GEMM-bound；`cuda_api_sum`
+  看 `cuLaunchKernelEx` / `cudaStreamSynchronize` 占比判断是否 launch-bound。
+- **过程**：`bench_kv` 单跑孤立 prefill/step；nsys 采 `bench_kv`（有/无 CG）；TRT 侧 `trt-profile`
+  出 `llm/denoise.profile.json` 做 layer 基线。
+- **结果**：matmul 类 ~50%+、transpose 类 ~35–40%，`cudaMemcpy` 仅 4.7% → **GEMM/布局问题**；
+  CUDA Graph 反而变慢（launch 非首要瓶颈）。→ 决策先做 Phase B，不先上 Graph。
+- **副作用**：无（仅测量）。
+
+### [B] cuBLAS GEMM 卸载 + Transpose 融合 ✅（2026-07-12）
+
+- **动机**：默认 CUDA pipeline 只有 `dlight.gpu.Matmul`，通用 tiled GEMM 打不满算力；且 dlight
+  把权重布局转置发成独立 `transpose*` kernel，nsys 里「转置税」≈35%，TRT（Myelin 直接 GEMM）没有。
+- **原理**：
+  1. `partition_for_cublas`：用 `FuseOpsByPattern` 匹配 `matmul` / `matmul_transposed` /
+     `matmul+bias` 等 pattern，打包成带 `Codegen="cublas"` 注解的 composite 函数。
+     其中 **`matmul_transposed` pattern 直接匹配 `matmul(x, transpose(w))`**，把显式 transpose 一并吸收。
+  2. `RunCodegen`：把这些 composite 换成 cuBLAS 外部调用（`cublasGemmEx`，fp16 输入 / fp32 累加），
+     绕开 dlight。
+  3. `FuseTransposeMatmul`：处理 cuBLAS 未覆盖的残留 `transpose(w) @ x`，改写成带 `transpose_b`
+     标志的 matmul，消掉独立 transpose kernel。
+  - **顺序关键**：三者都作用于高层 `relax.matmul` op，**必须在 `LegalizeOps` 之前**跑；先 BLAS 分区
+    （把转置型 matmul 直接吃进 cuBLAS），再 FuseTransposeMatmul 收尾，最后走默认 pipeline
+    （`LegalizeOps` 跳过 extern 调用，dlight 只调度剩余算子）。
+- **实现**：`python/mlc_vla/compile.py`
+
+```python
+def apply_gemm_prepasses(mod, tgt):
+    from tvm import relax
+    from tvm.relax.backend.cuda.cublas import partition_for_cublas
+    with tgt:
+        mod = partition_for_cublas(mod)      # 1. pattern 分区 -> composite(Codegen=cublas)
+        mod = relax.transform.RunCodegen()(mod)          # 2. 生成 cuBLAS extern 调用
+        mod = relax.transform.FuseTransposeMatmul()(mod) # 3. 融合残留 transpose@matmul
+    return mod
+
+# compile_model(...): CUDA 目标且 cublas=True 时，在 get_default_pipeline 前调用
+if cublas and tgt.kind.name == "cuda":
+    mod = apply_gemm_prepasses(mod, tgt)
+```
+
+  开关贯通：`compile_model` / `compile_model_quant` / `bench_kv` / `compare_kv` / `sample.PiZeroRunner`
+  均加 `--cublas`（默认关，opt-in）。
+- **过程**：先 `tvm.get_global_func('relax.ext.cublas', True)` 确认扩展可用 → `bench_kv` 跑
+  无/有 `--cublas` A/B → 写临时脚本跨路径对比 cuBLAS vs dlight 输出 cosine 校验数值。
+- **结果**：prefill 209→**87.7 ms**（2.4×）、step 22.0→**4.87 ms**（4.5×）、整环 429→**136 ms**（3.15×）；
+  单步与整环**低于 TRT**，G1/G2/G3 全过；cosine=0.999943（G5 过）。详见 §1.0.1。
+- **副作用**：需环境带 cuBLAS 扩展；无扩展环境不能默认开（见下方计划 [D0]）。量化路径的
+  dequantize+matmul 不匹配 cuBLAS pattern，`--cublas` 对量化基本是 no-op。
+
+### [C] Denoise 单步融合（🚧 计划，锦上添花）
+
+- **动机**：孤立单步已反超 TRT（4.87<5.5 ms），Phase C 优先级下调；若整环仍想再压，
+  按 §1.3 靶心做 adaRMS/time 调制预计算、suffix-only attention 融合、epilogue 融合。
+- **原理**：`time_emb` 仅依赖步序 → 编译期/host 预计算，砍每步 time MLP；RMSNorm+residual+SiLU
+  链 `FuseTIR` 合并，减少小 kernel 数与 launch。
+- **验收**：见 Phase C 表 C1–C5；每改一处补一条本日志。
+
+### [D0] cuBLAS 设为 CUDA 默认（带可用性守卫）（⬜ 计划）
+
+- **动机**：Phase B 收益巨大且数值等价，应成为 CUDA 默认路径。
+- **原理/实现**：在 `compile.py` 里 `available = bool(tvm.get_global_func('relax.ext.cublas', True))`，
+  `cublas` 默认取 `available`；无扩展环境（部分 Thor 构建）自动回退 dlight，避免 build 失败。
+- **联动**：Chamleon worker / `PiZeroRunner` 生产路径默认开 → 跑 `chameleon bench` 验 G4（端到端）。
+
+### [E] 超越 TRT（⬜ 计划）
+
+- prefill W4/W8 量化换带宽；denoise 手写 BYOC FMHA；MetaSchedule 调残留 TIR；FP8 KV（另设数值 gate）。
+
+---
+
 ## 5. 风险与非目标
 
 | 项 | 说明 |
