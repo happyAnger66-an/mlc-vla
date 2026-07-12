@@ -12,6 +12,16 @@ dependencies = [
     # TVM (Unity/Relax) 需单独安装/构建，见 README
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mlc_vla*"]
+
+[tool.pytest.ini_options]
+# 从 python/ 目录直接 import mlc_vla（无需 pip install -e），并把 e2e 测试放在 tests/。
+# 需先按 README 配好 TVM 的 PYTHONPATH/TVM_LIBRARY_PATH；缺 TVM 或 c-codegen 时测试自动 skip。
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"

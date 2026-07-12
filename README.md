@@ -174,7 +174,28 @@ actions = runner.sample_graph(params, prefix_embs, noise=None, seed=0)
 更深 profiling（nsys、与 TRT layer 对照）见 Chamleon：
 `docs/optimizer/pi05/trt_tvm_profile.md`、`scripts/profile_pi05_trt_tvm.sh`。
 
-延迟差距分析与对齐/超越计划：[`docs/optimize/tvm_vs_trt.md`](docs/optimize/tvm_vs_trt.md)。
+延迟差距分析与对齐/超越计划：[`docs/optimize/tvm_vs_trt.md`](docs/optimize/tvm_vs_trt.md)
+（Jetson Thor / Blackwell：[`docs/optimize/tvm_in_thor.md`](docs/optimize/tvm_in_thor.md)）。
+
+---
+
+## 测试
+
+`python/tests/` 是**面向对外接口的 e2e 测试**（非细粒度单测），全部走 TVM `c` 目标（CPU + gcc，
+**无需 GPU**）。缺 TVM / 无 C 编译器的环境会自动 skip。
+
+```bash
+source /path/to/Chamleon/scripts/tvm_env.sh   # 配好 TVM_HOME / PYTHONPATH / TVM_LIBRARY_PATH
+cd python && "$MLC_VLA_PY" -m pytest tests/ -ra
+```
+
+| 文件 | 覆盖的对外接口 |
+|------|----------------|
+| `test_config_interface.py` | `Pi0Config.from_openpi_config`（worker 构造路径）+ 派生量 / 双专家校验 |
+| `test_compile_and_run.py` | `compile_model` + VM 执行 `prefill` / `denoise_step` / `denoise_step_kv` / `denoise_loop_kv`（shape/dtype/finite） |
+| `test_numerical_gates.py` | 验收门禁：`compare_kv`（M1≡M0）、`compare_loop`（图内环≡宿主环） |
+| `test_pizero_runner.py` | `PiZeroRunner.sample` / `sample_graph` / `prefix_pad`（Chamleon worker 实际驱动的类） |
+| `test_cublas_guard.py` | `resolve_cublas` / `cublas_available` 三态守卫（决定 CUDA 走 cuBLAS 或回退 dlight） |
 
 ---
 
