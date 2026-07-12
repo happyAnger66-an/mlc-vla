@@ -150,20 +150,27 @@ def main():
                     help="cuBLAS+FuseTransposeMatmul（Phase B）；默认自动（CUDA 且扩展可用即开），"
                          "可用 --no-cublas 强制关闭")
     ap.add_argument("--quant", default=None, help="量化预设（如 q4bf16_1）；给定则测量化 M1 路径")
+    ap.add_argument("--attn-logits-dtype", default=None,
+                    help="attention QK^T 输入 dtype：float32（默认，非 tensor-core sgemm）或 "
+                         "float16（tensor-core，Blackwell 上省显著；精度需 compare 验证）")
     args = ap.parse_args()
+
+    def _mk(dtype):
+        cfg = dataclasses.replace(Pi0Config(), dtype=dtype)
+        if args.attn_logits_dtype:
+            cfg = dataclasses.replace(cfg, attn_logits_dtype=args.attn_logits_dtype)
+        return cfg
 
     if args.quant:
         from mlc_vla.quant import get_quant
 
         dtype = args.dtype or get_quant(args.quant).model_dtype
-        config = dataclasses.replace(Pi0Config(), dtype=dtype)
-        run_quant(config, args.target, args.quant, args.steps, args.iters,
+        run_quant(_mk(dtype), args.target, args.quant, args.steps, args.iters,
                   cuda_graph=args.cuda_graph, cublas=args.cublas)
         return
 
     dtype = args.dtype or ("float32" if "llvm" in args.target or args.target == "c" else "bfloat16")
-    config = dataclasses.replace(Pi0Config(), dtype=dtype)
-    run(config, args.target, args.steps, args.iters, cuda_graph=args.cuda_graph, cublas=args.cublas)
+    run(_mk(dtype), args.target, args.steps, args.iters, cuda_graph=args.cuda_graph, cublas=args.cublas)
 
 
 if __name__ == "__main__":
