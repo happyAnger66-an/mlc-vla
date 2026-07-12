@@ -52,43 +52,6 @@ TVM（通用编译器底座：Relax / TIR / VM / Codegen / Disco）
 
 ---
 
-## 项目结构
-
-```
-mlc-vla/
-├── README.md
-├── docs/
-│   ├── arch.md                 # 架构设计 / 复用矩阵 / 路线图
-│   ├── M0.md                   # M0：单步前向打通
-│   └── M1.md                   # M1/M1+：KV 固化、loop、Chameleon 评测
-└── python/
-    ├── pyproject.toml
-    └── mlc_vla/
-        ├── compile.py          # 导出 IRModule + 编译 + 冒烟
-        ├── compile_quant.py    # group 量化编译
-        ├── quant.py            # GroupQuantize + 预设（q4f16_1 等）
-        ├── sample.py           # PiZeroRunner：prefill + 宿主/图内去噪环
-        ├── openpi_ref.py       # 自包含 / openpi 参考前向
-        ├── compare.py          # vs openpi 单步对拍（mode A/B，可 --kv）
-        ├── compare_kv.py       # M1 vs M0 数值对拍
-        ├── compare_loop.py     # denoise_loop_kv vs 宿主逐步环
-        ├── compare_pad.py      # prefix padding + mask 自洽
-        ├── compare_embed.py    # embed bf16 vs fp32
-        ├── compare_quant.py    # 量化 vs 全精度对拍
-        ├── bench_kv.py         # prefill / denoise_step_kv 测速
-        └── model/pi0/
-            ├── pi0_config.py   # 双专家 Gemma + SigLIP + 动作维
-            ├── gemma_dual.py   # 联合注意力 / RoPE / 门控 FFN / adaRMS
-            ├── siglip.py       # SigLIP + LayerNormF32（bf16 友好）
-            ├── pi0_model.py    # 导出函数 + 分段 include
-            └── pi0_loader.py   # openpi → MLC 权重映射
-```
-
-端到端 LIBERO 评测在 **Chameleon**（双进程：openpi 3.11 ↔ TVM worker 3.12），不在本仓：
-`Chamleon/chameleon/runtime/pi05_tvm/`、`configs/pi05/pi05_libero_tvm_*.yaml`。
-
----
-
 ## 环境
 
 - **TVM**：Unity/Relax（含 `tvm.relax.frontend.nn`），建议本仓旁路 `edgeLLM/tvm`。
@@ -170,12 +133,6 @@ actions = runner.sample_graph(params, prefix_embs, noise=None, seed=0)
 | `compare_kv` / `compare_loop` / `compare_pad` | M1 自洽与 loop / padding |
 | `compare_embed` / `compare_quant` | embed dtype、量化误差 |
 | `bench_kv` | `prefill` / `denoise_step_kv`（及可选 M0）延迟 |
-
-更深 profiling（nsys、与 TRT layer 对照）见 Chamleon：
-`docs/optimizer/pi05/trt_tvm_profile.md`、`scripts/profile_pi05_trt_tvm.sh`。
-
-延迟差距分析与对齐/超越计划：[`docs/optimize/tvm_vs_trt.md`](docs/optimize/tvm_vs_trt.md)
-（Jetson Thor / Blackwell：[`docs/optimize/tvm_in_thor.md`](docs/optimize/tvm_in_thor.md)）。
 
 ---
 
