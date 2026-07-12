@@ -77,13 +77,15 @@ def euler_loop(step_fn, x0: np.ndarray, num_steps: int) -> np.ndarray:
 class PiZeroRunner:
     """编译 M1 KV 路径并在宿主侧编排去噪环。"""
 
-    def __init__(self, config: Pi0Config, target: str = "cuda"):
+    def __init__(self, config: Pi0Config, target: str = "cuda", cuda_graph: bool = False):
         import tvm
         from tvm import relax
 
         self.config = config
         self.target = target
-        self.ex, self.named_params = compile_model(config, target, functions=_KV_FUNCS)
+        self.ex, self.named_params = compile_model(
+            config, target, functions=_KV_FUNCS, cuda_graph=cuda_graph
+        )
         self.dev = _device_for(target)
         self.vm = relax.VirtualMachine(self.ex, self.dev)
         self._tvm = tvm

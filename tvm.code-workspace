@@ -1,0 +1,26 @@
+{
+	"folders": [
+		{
+			"path": "../tvm"
+		},
+		{
+			"path": "../tvm_tutorials"
+		},
+		{
+			"path": "../mlc-llm"
+		},
+		{
+			"path": "../TensorRT-Edge-LLM"
+		},
+		{
+			"path": "../Chamleon"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../nio/nio/tvm"
+		}
+	],
+	"settings": {}
+}
