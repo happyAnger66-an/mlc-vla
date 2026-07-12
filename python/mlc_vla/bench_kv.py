@@ -50,15 +50,17 @@ def _bench(fn, iters: int, sync) -> float:
     return (time.perf_counter() - t0) / iters * 1e3  # ms/iter
 
 
-def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool = False):
+def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool = False,
+        cublas: bool = False):
     import tvm
     from tvm import relax
 
-    ex, named_params = compile_model(config, target, functions=_FUNCS, cuda_graph=cuda_graph)
+    ex, named_params = compile_model(config, target, functions=_FUNCS, cuda_graph=cuda_graph,
+                                     cublas=cublas)
     dev = _device_for(target)
     vm = relax.VirtualMachine(ex, dev)
     sync = (lambda: dev.sync()) if hasattr(dev, "sync") else (lambda: None)
-    print(f"[bench] cuda_graph requested={cuda_graph}")
+    print(f"[bench] cuda_graph requested={cuda_graph} cublas={cublas}")
 
     rng = np.random.default_rng(0)
     params = [
@@ -94,7 +96,7 @@ def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool
 
 
 def run_quant(config: Pi0Config, target: str, quant_name: str, steps: int, iters: int,
-              cuda_graph: bool = False):
+              cuda_graph: bool = False, cublas: bool = False):
     """量化 M1 路径测速（随机权重；延迟与权重值无关）。"""
     import tvm
     from tvm import relax
@@ -103,7 +105,7 @@ def run_quant(config: Pi0Config, target: str, quant_name: str, steps: int, iters
 
     kv_funcs = ["prefill", "denoise_step_kv"]
     ex, q_named_params, _qmap, quant = compile_model_quant(
-        config, target, kv_funcs, quant_name, cuda_graph=cuda_graph)
+        config, target, kv_funcs, quant_name, cuda_graph=cuda_graph, cublas=cublas)
     dev = _device_for(target)
     vm = relax.VirtualMachine(ex, dev)
     sync = (lambda: dev.sync()) if hasattr(dev, "sync") else (lambda: None)
@@ -141,6 +143,8 @@ def main():
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--cuda-graph", action="store_true", help="开启 RewriteCUDAGraph 捕获去噪步")
+    ap.add_argument("--cublas", action="store_true",
+                    help="把 matmul 卸载到 cuBLAS 并融合 transpose（Phase B）")
     ap.add_argument("--quant", default=None, help="量化预设（如 q4bf16_1）；给定则测量化 M1 路径")
     args = ap.parse_args()
 
@@ -149,12 +153,13 @@ def main():
 
         dtype = args.dtype or get_quant(args.quant).model_dtype
         config = dataclasses.replace(Pi0Config(), dtype=dtype)
-        run_quant(config, args.target, args.quant, args.steps, args.iters, cuda_graph=args.cuda_graph)
+        run_quant(config, args.target, args.quant, args.steps, args.iters,
+                  cuda_graph=args.cuda_graph, cublas=args.cublas)
         return
 
     dtype = args.dtype or ("float32" if "llvm" in args.target or args.target == "c" else "bfloat16")
     config = dataclasses.replace(Pi0Config(), dtype=dtype)
-    run(config, args.target, args.steps, args.iters, cuda_graph=args.cuda_graph)
+    run(config, args.target, args.steps, args.iters, cuda_graph=args.cuda_graph, cublas=args.cublas)
 
 
 if __name__ == "__main__":

@@ -36,11 +36,11 @@ def _unpack(ret):
     return [ret[i] for i in range(len(ret))]
 
 
-def run(config: Pi0Config, target: str, loop_steps: int = 0):
+def run(config: Pi0Config, target: str, loop_steps: int = 0, cublas: bool = False):
     import tvm
     from tvm import relax
 
-    ex, named_params = compile_model(config, target, functions=_FUNCS)
+    ex, named_params = compile_model(config, target, functions=_FUNCS, cublas=cublas)
     dev = _device_for(target)
     vm = relax.VirtualMachine(ex, dev)
 
@@ -122,6 +122,7 @@ def main():
     ap.add_argument("--dtype", default=None, help="覆盖 config.dtype（如 bfloat16/float16/float32）")
     ap.add_argument("--dummy", action="store_true", help="小尺寸专家，快速验证 M1==M0")
     ap.add_argument("--loop", type=int, default=0, help="额外跑 N 步 Euler 全环对拍（M1 vs M0）")
+    ap.add_argument("--cublas", action="store_true", help="走 cuBLAS + FuseTransposeMatmul 路径")
     args = ap.parse_args()
 
     if args.dummy:
@@ -135,7 +136,7 @@ def main():
         config = Pi0Config()
     dtype = args.dtype or ("float32" if "llvm" in args.target or args.target == "c" else "bfloat16")
     config = dataclasses.replace(config, dtype=dtype)
-    ok = run(config, args.target, loop_steps=args.loop)
+    ok = run(config, args.target, loop_steps=args.loop, cublas=args.cublas)
     raise SystemExit(0 if ok else 1)
 
 

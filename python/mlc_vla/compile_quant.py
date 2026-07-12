@@ -44,7 +44,7 @@ def build_quant_irmodule(config: Pi0Config, functions, quant_name: str):
 
 
 def compile_model_quant(config: Pi0Config, target: str, functions, quant_name: str,
-                        cuda_graph: bool = False):
+                        cuda_graph: bool = False, cublas: bool = False):
     """编译量化模型，返回 (ex, q_named_params, quant_map, quant)。"""
     import tvm
     from tvm import relax
@@ -53,6 +53,10 @@ def compile_model_quant(config: Pi0Config, target: str, functions, quant_name: s
     tgt = tvm.target.Target(target)
     if tgt.kind.name == "cuda":
         os.environ.setdefault("TVM_CUDA_COMPILE_MODE", "nvcc")
+    if cublas and tgt.kind.name == "cuda":
+        from mlc_vla.compile import apply_gemm_prepasses
+
+        mod = apply_gemm_prepasses(mod, tgt)
     relax_pipeline = relax.get_default_pipeline(tgt)
     pass_cfg = {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}
     with tgt, tvm.transform.PassContext(config=pass_cfg):

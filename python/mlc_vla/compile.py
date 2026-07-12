@@ -38,13 +38,35 @@ def build_irmodule(config: Pi0Config, functions=None):
     return model, mod, named_params, ext_mods
 
 
-def compile_model(config: Pi0Config, target: str = "c", functions=None, cuda_graph: bool = False):
+def apply_gemm_prepasses(mod, tgt):
+    """CUDA 目标下把 matmul 卸载到 cuBLAS，并把 transpose+matmul 融合掉「转置税」。
+
+    对齐 MLC LLM 的 ``BLASDispatch`` + ``FuseTransposeMatmul``（须在 LegalizeOps 之前）：
+      - ``partition_for_cublas`` + ``RunCodegen``：把 ``matmul`` / ``matmul_transposed`` 等
+        pattern 分区并生成 cuBLAS 外部调用（``matmul_transposed`` 直接吃掉显式 transpose）。
+      - ``FuseTransposeMatmul``：处理 cuBLAS 未覆盖的残留 ``transpose(w) @ x``。
+    nsys 基线里 ``transpose*`` 约占 GPU 时间 1/3，本 pass 是 Phase B 主收益来源。
+    """
+    import tvm
+    from tvm import relax
+    from tvm.relax.backend.cuda.cublas import partition_for_cublas
+
+    with tgt:
+        mod = partition_for_cublas(mod)
+        mod = relax.transform.RunCodegen()(mod)
+        mod = relax.transform.FuseTransposeMatmul()(mod)
+    return mod
+
+
+def compile_model(config: Pi0Config, target: str = "c", functions=None,
+                  cuda_graph: bool = False, cublas: bool = False):
     """编译模型，返回 (VM 可加载对象, named_params)。
 
     - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
     - GPU 目标（cuda/metal/...）：使用 target 感知的默认 pipeline。
     - ``cuda_graph``：CUDA 目标下开启 ``RewriteCUDAGraph``，把去噪步的静态 kernel 序列
       捕获成 CUDA Graph（一次 launch 重放），降低 host 端多 kernel launch 开销。
+    - ``cublas``：CUDA 目标下把 matmul 卸载到 cuBLAS 并融合 transpose（Phase B）。
     """
     import os
     import tempfile
@@ -63,6 +85,8 @@ def compile_model(config: Pi0Config, target: str = "c", functions=None, cuda_gra
         so_path = os.path.join(tempfile.mkdtemp(prefix="mlc_vla_"), "pi0.so")
         ex.export_library(so_path)
         return tvm.runtime.load_module(so_path), named_params
+    if cublas and tgt.kind.name == "cuda":
+        mod = apply_gemm_prepasses(mod, tgt)
     relax_pipeline = relax.get_default_pipeline(tgt)
     pass_cfg = {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}
     with tgt, tvm.transform.PassContext(config=pass_cfg):
