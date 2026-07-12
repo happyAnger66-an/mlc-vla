@@ -51,16 +51,19 @@ def _bench(fn, iters: int, sync) -> float:
 
 
 def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool = False,
-        cublas: bool = False):
+        cublas=None):
     import tvm
     from tvm import relax
 
+    from mlc_vla.compile import resolve_cublas
+
+    eff_cublas = resolve_cublas(cublas, tvm.target.Target(target).kind.name)
     ex, named_params = compile_model(config, target, functions=_FUNCS, cuda_graph=cuda_graph,
                                      cublas=cublas)
     dev = _device_for(target)
     vm = relax.VirtualMachine(ex, dev)
     sync = (lambda: dev.sync()) if hasattr(dev, "sync") else (lambda: None)
-    print(f"[bench] cuda_graph requested={cuda_graph} cublas={cublas}")
+    print(f"[bench] cuda_graph requested={cuda_graph} cublas={eff_cublas} (arg={cublas})")
 
     rng = np.random.default_rng(0)
     params = [
@@ -96,7 +99,7 @@ def run(config: Pi0Config, target: str, steps: int, iters: int, cuda_graph: bool
 
 
 def run_quant(config: Pi0Config, target: str, quant_name: str, steps: int, iters: int,
-              cuda_graph: bool = False, cublas: bool = False):
+              cuda_graph: bool = False, cublas=None):
     """量化 M1 路径测速（随机权重；延迟与权重值无关）。"""
     import tvm
     from tvm import relax
@@ -143,8 +146,9 @@ def main():
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--cuda-graph", action="store_true", help="开启 RewriteCUDAGraph 捕获去噪步")
-    ap.add_argument("--cublas", action="store_true",
-                    help="把 matmul 卸载到 cuBLAS 并融合 transpose（Phase B）")
+    ap.add_argument("--cublas", action=argparse.BooleanOptionalAction, default=None,
+                    help="cuBLAS+FuseTransposeMatmul（Phase B）；默认自动（CUDA 且扩展可用即开），"
+                         "可用 --no-cublas 强制关闭")
     ap.add_argument("--quant", default=None, help="量化预设（如 q4bf16_1）；给定则测量化 M1 路径")
     args = ap.parse_args()
 

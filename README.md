@@ -1,6 +1,6 @@
 # MLC-VLA
 
-> **一句话定位**：MLC-VLA 是 **TVM 的第二个垂直领域实现**（与 [MLC LLM](https://github.com/mlc-ai/mlc-llm) 平级）——把 TVM 通用 ML 编译器底座针对 **VLA（Vision-Language-Action）/ 流匹配动作生成** 场景做满配。第一个落地目标是 **π0.5**。
+> MLC-VLA 是 **TVM 的第二个垂直领域实现**（与 [MLC LLM](https://github.com/mlc-ai/mlc-llm) 平级）——把 TVM 通用 ML 编译器底座针对 **VLA（Vision-Language-Action）/ 流匹配动作生成** 场景做满配。第一个落地目标是 **π0.5**。
 
 ```
 TVM（通用编译器底座：Relax / TIR / VM / Codegen / Disco）

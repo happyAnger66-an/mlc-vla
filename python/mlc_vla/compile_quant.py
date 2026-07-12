@@ -44,18 +44,22 @@ def build_quant_irmodule(config: Pi0Config, functions, quant_name: str):
 
 
 def compile_model_quant(config: Pi0Config, target: str, functions, quant_name: str,
-                        cuda_graph: bool = False, cublas: bool = False):
-    """编译量化模型，返回 (ex, q_named_params, quant_map, quant)。"""
+                        cuda_graph: bool = False, cublas=None):
+    """编译量化模型，返回 (ex, q_named_params, quant_map, quant)。
+
+    ``cublas`` 三态语义同 ``compile.compile_model``；量化图里 dequantize+matmul 一般不匹配
+    cuBLAS pattern，故对量化基本是 no-op，仅命中未量化的少量 matmul。
+    """
     import tvm
     from tvm import relax
+
+    from mlc_vla.compile import apply_gemm_prepasses, resolve_cublas
 
     mod, q_named_params, qmap, quant = build_quant_irmodule(config, functions, quant_name)
     tgt = tvm.target.Target(target)
     if tgt.kind.name == "cuda":
         os.environ.setdefault("TVM_CUDA_COMPILE_MODE", "nvcc")
-    if cublas and tgt.kind.name == "cuda":
-        from mlc_vla.compile import apply_gemm_prepasses
-
+    if resolve_cublas(cublas, tgt.kind.name):
         mod = apply_gemm_prepasses(mod, tgt)
     relax_pipeline = relax.get_default_pipeline(tgt)
     pass_cfg = {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}

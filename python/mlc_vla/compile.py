@@ -38,6 +38,44 @@ def build_irmodule(config: Pi0Config, functions=None):
     return model, mod, named_params, ext_mods
 
 
+def cublas_available() -> bool:
+    """本机 TVM 是否编入 cuBLAS BYOC 扩展（``relax.ext.cublas``）。
+
+    无扩展时若强开 cuBLAS，`RunCodegen` 生成的 extern 调用会在 build 期失败；据此做
+    自动回退（见 ``resolve_cublas``）。
+    """
+    try:
+        import tvm
+
+        return bool(tvm.get_global_func("relax.ext.cublas", True))
+    except Exception:  # noqa: BLE001 - 探测失败一律视为不可用并回退 dlight
+        return False
+
+
+def resolve_cublas(cublas, target_kind: str) -> bool:
+    """把三态 ``cublas``（None=自动 / True / False）解析成实际是否启用。
+
+    - 仅 CUDA 目标可用；其它目标恒 False。
+    - ``None``：CUDA 且扩展可用则自动开（Phase B 已验证净收益且数值等价）。
+    - ``True``：扩展不可用时告警并回退 dlight（不让 build 崩）。
+    """
+    if target_kind != "cuda":
+        return False
+    avail = cublas_available()
+    if cublas is None:
+        return avail
+    if cublas and not avail:
+        import warnings
+
+        warnings.warn(
+            "cublas=True 但本机 TVM 未启用 relax.ext.cublas 扩展，回退 dlight GEMM。",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return bool(cublas)
+
+
 def apply_gemm_prepasses(mod, tgt):
     """CUDA 目标下把 matmul 卸载到 cuBLAS，并把 transpose+matmul 融合掉「转置税」。
 
@@ -59,14 +97,15 @@ def apply_gemm_prepasses(mod, tgt):
 
 
 def compile_model(config: Pi0Config, target: str = "c", functions=None,
-                  cuda_graph: bool = False, cublas: bool = False):
+                  cuda_graph: bool = False, cublas=None):
     """编译模型，返回 (VM 可加载对象, named_params)。
 
     - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
     - GPU 目标（cuda/metal/...）：使用 target 感知的默认 pipeline。
     - ``cuda_graph``：CUDA 目标下开启 ``RewriteCUDAGraph``，把去噪步的静态 kernel 序列
       捕获成 CUDA Graph（一次 launch 重放），降低 host 端多 kernel launch 开销。
-    - ``cublas``：CUDA 目标下把 matmul 卸载到 cuBLAS 并融合 transpose（Phase B）。
+    - ``cublas``：三态。``None``（默认）在 CUDA 且扩展可用时自动开启把 matmul 卸载到
+      cuBLAS 并融合 transpose（Phase B，净收益且数值等价）；``True``/``False`` 手动覆盖。
     """
     import os
     import tempfile
@@ -85,7 +124,7 @@ def compile_model(config: Pi0Config, target: str = "c", functions=None,
         so_path = os.path.join(tempfile.mkdtemp(prefix="mlc_vla_"), "pi0.so")
         ex.export_library(so_path)
         return tvm.runtime.load_module(so_path), named_params
-    if cublas and tgt.kind.name == "cuda":
+    if resolve_cublas(cublas, tgt.kind.name):
         mod = apply_gemm_prepasses(mod, tgt)
     relax_pipeline = relax.get_default_pipeline(tgt)
     pass_cfg = {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}
