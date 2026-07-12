@@ -36,7 +36,7 @@ def _unpack(ret):
     return [ret[i] for i in range(len(ret))]
 
 
-def run(config: Pi0Config, target: str, loop_steps: int = 0, cublas: bool = False):
+def run(config: Pi0Config, target: str, loop_steps: int = 0, cublas=None):
     import tvm
     from tvm import relax
 
@@ -122,7 +122,8 @@ def main():
     ap.add_argument("--dtype", default=None, help="覆盖 config.dtype（如 bfloat16/float16/float32）")
     ap.add_argument("--dummy", action="store_true", help="小尺寸专家，快速验证 M1==M0")
     ap.add_argument("--loop", type=int, default=0, help="额外跑 N 步 Euler 全环对拍（M1 vs M0）")
-    ap.add_argument("--cublas", action="store_true", help="走 cuBLAS + FuseTransposeMatmul 路径")
+    ap.add_argument("--cublas", action=argparse.BooleanOptionalAction, default=None,
+                    help="cuBLAS + FuseTransposeMatmul 路径；默认自动，--no-cublas 强制关闭")
     args = ap.parse_args()
 
     if args.dummy:

@@ -82,8 +82,12 @@ class PiZeroRunner:
         import tvm
         from tvm import relax
 
+        from mlc_vla.compile import resolve_cublas
+
         self.config = config
         self.target = target
+        self.cuda_graph = cuda_graph
+        self.cublas = resolve_cublas(cublas, tvm.target.Target(target).kind.name)
         self.ex, self.named_params = compile_model(
             config, target, functions=_KV_FUNCS, cuda_graph=cuda_graph, cublas=cublas
         )
