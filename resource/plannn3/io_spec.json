@@ -1,0 +1,75 @@
+{
+  "model": "plannn3",
+  "version": "v1.0.0",
+  "description": "Machine-readable input/output specification for the plannn3 benchmark example. Shapes and dtypes are taken from the golden reference sample (batch size 1); the leading batch dimension and per-sample token counts vary with the input.",
+  "entrypoint": "model.network.Net",
+  "stages": [
+    {
+      "name": "encoder",
+      "method": "trace_encoder_forward",
+      "detail": "Consumes the 6 inputs and returns token embeddings, position embeddings, and next_hist_img_feat."
+    },
+    {
+      "name": "prefill",
+      "method": "prefill",
+      "detail": "Runs the transformer over the prompt tokens and returns the first-step trajectory logits."
+    },
+    {
+      "name": "decode",
+      "method": "decode",
+      "detail": "18 autoregressive steps; each step takes argmax over the logits to emit the next trajectory token."
+    }
+  ],
+  "inputs": [
+    {
+      "name": "pinhole_raw_img",
+      "shape": [7, 3, 2168, 3848],
+      "dtype": "uint8",
+      "description": "Raw multi-view camera images indexed by multiview_cams_index; resized and centre-cropped inside the encoder."
+    },
+    {
+      "name": "hist_img_feat",
+      "shape": [1, 1600, 1024],
+      "dtype": "float32",
+      "description": "Historical image feature cache carried over from the previous step."
+    },
+    {
+      "name": "subpath_polylines",
+      "shape": [1, 30, 4, 2],
+      "dtype": "float32",
+      "description": "Navigation sub-path polylines (point coordinates)."
+    },
+    {
+      "name": "subpath_polylines_mask",
+      "shape": [1, 30],
+      "dtype": "int32",
+      "description": "Validity mask for the sub-path polylines."
+    },
+    {
+      "name": "navi_info",
+      "shape": [1, 33, 5],
+      "dtype": "int32",
+      "description": "Discrete navigation metadata tokens."
+    },
+    {
+      "name": "hist_action",
+      "shape": [1, 5, 3],
+      "dtype": "float32",
+      "description": "Historical ego waypoints; the first 4 are used as input and the 5th seeds the crop projection point."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "next_hist_img_feat",
+      "shape": [1, 1600, 1024],
+      "dtype": "float32",
+      "description": "Updated history image feature cache for the next inference step (continuous; validated to a small relative tolerance under TF32)."
+    },
+    {
+      "name": "traj_ids",
+      "shape": [1, 18],
+      "dtype": "int64",
+      "description": "Autoregressively generated trajectory tokens (3 meta-action tokens followed by 15 PCA trajectory tokens); validated bit-exactly against golden."
+    }
+  ]
+}

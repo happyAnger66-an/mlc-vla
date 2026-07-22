@@ -1,0 +1,331 @@
+{
+  "architectures": [
+    "Net"
+  ],
+  "bias": false,
+  "crop_target_size": {
+    "/camera/front/main": [
+      512,
+      1536,
+      224,
+      7
+    ],
+    "/camera/side/front/left": [
+      512,
+      512,
+      0,
+      0
+    ],
+    "/camera/side/front/right": [
+      512,
+      512,
+      0,
+      512
+    ],
+    "/camera/side/rear/left": [
+      512,
+      512,
+      0,
+      0
+    ],
+    "/camera/side/rear/right": [
+      512,
+      512,
+      0,
+      512
+    ]
+  },
+  "dropout": 0.0,
+  "fixed_proj_point": [
+    297.3,
+    767.5
+  ],
+  "forward_func_name": "train_forward",
+  "freeze_transformer": false,
+  "kv_cache_batch_size": 1,
+  "kv_cache_dtype": "float32",
+  "max_sequence_size": 1656,
+  "module_list": [
+    {
+      "encoder": {
+        "add_pe": false,
+        "enable_fold_fw": true,
+        "hidden_size": 1024,
+        "label_key": "traj_min_dist_label",
+        "multiview_cams": [
+          "/camera/front/main",
+          "/camera/side/front/left",
+          "/camera/side/front/right",
+          "/camera/side/rear/left",
+          "/camera/side/rear/right"
+        ],
+        "patch_size": [
+          32,
+          64
+        ],
+        "point_encoder_cfg": {
+          "hidden_dim": 64,
+          "in_channels": 2,
+          "num_head": 16,
+          "type": "model.encoder.point_encoder.PointEncoderV2"
+        },
+        "projection_point": true,
+        "return_pe": true,
+        "sequence_size": 1570,
+        "temporal_multiview_configs": [
+          [
+            [
+              "/camera/front/main"
+            ],
+            [
+              [
+                0.5,
+                0.5
+              ]
+            ]
+          ],
+          [
+            [
+              "/camera/front/main"
+            ],
+            [
+              [
+                0.5,
+                0.5
+              ]
+            ]
+          ],
+          [
+            [
+              "/camera/front/main",
+              "/camera/side/front/left",
+              "/camera/side/front/right",
+              "/camera/side/rear/left",
+              "/camera/side/rear/right"
+            ],
+            [
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ]
+            ]
+          ],
+          [
+            [
+              "/camera/front/main",
+              "/camera/side/front/left",
+              "/camera/side/front/right",
+              "/camera/side/rear/left",
+              "/camera/side/rear/right"
+            ],
+            [
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ],
+              [
+                0.5,
+                0.5
+              ]
+            ]
+          ],
+          [
+            [
+              "/camera/front/main",
+              "/camera/side/front/left",
+              "/camera/side/front/right",
+              "/camera/side/rear/left",
+              "/camera/side/rear/right"
+            ],
+            [
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                1
+              ]
+            ]
+          ]
+        ],
+        "type": "model.encoder.visual_encoder.VisualTokenizer",
+        "video_shape": {
+          "/camera/front/main": [
+            512,
+            1536,
+            224,
+            7
+          ],
+          "/camera/side/front/left": [
+            512,
+            512,
+            0,
+            0
+          ],
+          "/camera/side/front/right": [
+            512,
+            512,
+            0,
+            512
+          ],
+          "/camera/side/rear/left": [
+            512,
+            512,
+            0,
+            0
+          ],
+          "/camera/side/rear/right": [
+            512,
+            512,
+            0,
+            512
+          ]
+        },
+        "vqgan_cfg": {
+          "mid_channel": 384,
+          "out_channel": 1024,
+          "timm_config": {
+            "checkpoint": "/share-global/jin.chen4/shares/models/dinov3_encoder/vit_small_plus_patch16_dinov3_expand256.lvd1689m.bin",
+            "model_name": "vit_small_plus_patch16_dinov3.lvd1689m"
+          },
+          "type": "model.encoder.dinov3_encoder.Dinov3Encoder"
+        }
+      },
+      "name": "visual"
+    },
+    {
+      "encoder": {
+        "n_embed": 1024,
+        "navi_cls1_vocab_size": 7,
+        "navi_cls2_vocab_size": 62,
+        "navi_cls3_vocab_size": 33,
+        "navi_cls4_vocab_size": 22,
+        "type": "model.encoder.navigation_encoder_2.NaviTokenizer"
+      },
+      "name": "navi"
+    },
+    {
+      "encoder": {
+        "hidden_size": 1024,
+        "mask_prob": 0.5,
+        "sequence_size": 4,
+        "token_file": "/share-global/zeqi.li1/plannn2_codebook/5fps_50w_768.npy",
+        "type": "model.encoder.trajectory_encoder.HisTrajTokenizer",
+        "vocab_size": 1024
+      },
+      "name": "history_traj"
+    },
+    {
+      "encoder": {
+        "begin_size": 1,
+        "encode_type": "pca",
+        "end_size": 1,
+        "hidden_size": 1024,
+        "learnable_size": 15,
+        "meta_action_size": 3,
+        "sequence_size": 19,
+        "token_file": "/share-global/jin.chen4/tokenizer/pca_dxdydyaw_rearaxlecenter_0205_fixmeanstd/pred_dxdydyaw_pca_tokenizer.json",
+        "traj_size": 1024,
+        "type": "model.encoder.trajectory_encoder_v2.TrajTokenizer",
+        "use_default_prob": 0.0,
+        "vocab_size": 1169
+      },
+      "head": {
+        "enable_critic_head": false,
+        "input_dim": 1024,
+        "output_dim": 1169,
+        "traj_size": 1024,
+        "type": "model.head.trajectory_head.TrajHead",
+        "use_bias": false,
+        "use_rmsnorm": false
+      },
+      "name": "traj"
+    }
+  ],
+  "multiview_cams": [
+    "/camera/front/main",
+    "/camera/side/front/left",
+    "/camera/side/front/right",
+    "/camera/side/rear/left",
+    "/camera/side/rear/right"
+  ],
+  "multiview_cams_index": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "n_embd": 1024,
+  "n_head": 16,
+  "n_layer": 12,
+  "resize_target_size": {
+    "/camera/front/main": [
+      1024,
+      1550
+    ],
+    "/camera/side/front/left": [
+      512,
+      1024
+    ],
+    "/camera/side/front/right": [
+      512,
+      1024
+    ],
+    "/camera/side/rear/left": [
+      512,
+      1024
+    ],
+    "/camera/side/rear/right": [
+      512,
+      1024
+    ]
+  },
+  "speed_token_history_mask_prob": 0.5,
+  "speed_token_traj_offset": 3,
+  "torch_dtype": "float32",
+  "transformers_version": "4.46.3",
+  "use_kv_cache": false,
+  "use_rmsnorm": false
+}

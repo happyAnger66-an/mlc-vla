@@ -1,0 +1,10 @@
+{
+  "model": "plannn3",
+  "version": "v1.0.0",
+  "raw_model_defination": "/share-global/jin.chen4/plannn3/local_output/imitation_learning/baseline_v1.63_non_uniform_sample_3s_img/traced_model_bak-epoch000-step0095000_onemodel/plannn3",
+  "weights_path": "/share-global/lizhao.li/nn3/traced_tmp/local_output/trace/baseline_v1.6/traced_model_epoch000-step0001000_onemodel/trace_model/pytorch_model.bin",
+  "golden_inputs_path": "/share-global/lizhao.li/nn3/traced_tmp/local_output/trace/baseline_v1.6/traced_model_epoch000-step0001000_onemodel/input_list.pkl",
+  "golden_outputs_path": "/share-global/lizhao.li/nn3/traced_tmp/local_output/trace/baseline_v1.6/traced_model_epoch000-step0001000_onemodel/output.pkl",
+  "updated": "2026-06-21",
+  "notes": "Minimal inference-only extraction. model/ mirrors the raw plannn3 package with imports rewritten to the local model.* namespace; model_config.json mirrors trace_model/config.json with model.* type strings and training losses removed. NFS asset paths (dinov3 checkpoint, PCA and history-trajectory tokenisers) are referenced inside model_config.json. Weights and golden pickles stay on NFS and are never committed."
+}
