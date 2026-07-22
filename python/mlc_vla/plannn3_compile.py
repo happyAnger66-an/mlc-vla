@@ -16,7 +16,12 @@ import argparse
 
 import numpy as np
 
-from mlc_vla.model.plannn3 import Plannn3Config, Plannn3Model
+from mlc_vla.model.plannn3 import (
+    Dinov3Config,
+    Dinov3VisualEncoder,
+    Plannn3Config,
+    Plannn3Model,
+)
 from mlc_vla.model.plannn3.plannn3_model import _rope_tables_np
 
 
@@ -31,19 +36,25 @@ def build_irmodule(config: Plannn3Config, functions=None):
     return model, mod, named_params, ext_mods
 
 
-def compile_model(config: Plannn3Config, target: str = "c", functions=None):
-    """编译模型，返回 (VM 可加载对象, named_params)。
+def build_visual_irmodule(vcfg: Dinov3Config, functions=None):
+    """实例化 DINOv3 视觉塔并导出 relax IRModule + 参数规格。"""
+    model = Dinov3VisualEncoder(vcfg)
+    model.to(vcfg.dtype)
+    mod, named_params, ext_mods = model.export_tvm(
+        spec=model.get_default_spec(functions=functions),
+        allow_extern=True,
+    )
+    return model, mod, named_params, ext_mods
 
-    - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
-    - 其它目标（llvm/cuda/...）：使用 target 感知的默认 pipeline。
-    """
+
+def _build_and_compile(mod, named_params, target: str):
+    """公共编译尾：c 目标走 zero pipeline+gcc；其它走默认 pipeline。"""
     import os
     import tempfile
 
     import tvm
     from tvm import relax
 
-    _, mod, named_params, _ = build_irmodule(config, functions=functions)
     tgt = tvm.target.Target(target)
     if tgt.kind.name == "cuda":
         os.environ.setdefault("TVM_CUDA_COMPILE_MODE", "nvcc")
@@ -53,10 +64,25 @@ def compile_model(config: Plannn3Config, target: str = "c", functions=None):
         so_path = os.path.join(tempfile.mkdtemp(prefix="mlc_vla_p3_"), "plannn3.so")
         ex.export_library(so_path)
         return tvm.runtime.load_module(so_path), named_params
-    relax_pipeline = relax.get_default_pipeline(tgt)
     with tgt:
-        ex = relax.build(mod, target=tgt, relax_pipeline=relax_pipeline)
+        ex = relax.build(mod, target=tgt, relax_pipeline=relax.get_default_pipeline(tgt))
     return ex, named_params
+
+
+def compile_visual(vcfg: Dinov3Config, target: str = "c", functions=None):
+    """编译 DINOv3 视觉塔，返回 (VM 可加载对象, named_params)。"""
+    _, mod, named_params, _ = build_visual_irmodule(vcfg, functions=functions)
+    return _build_and_compile(mod, named_params, target)
+
+
+def compile_model(config: Plannn3Config, target: str = "c", functions=None):
+    """编译模型，返回 (VM 可加载对象, named_params)。
+
+    - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
+    - 其它目标（llvm/cuda/...）：使用 target 感知的默认 pipeline。
+    """
+    _, mod, named_params, _ = build_irmodule(config, functions=functions)
+    return _build_and_compile(mod, named_params, target)
 
 
 def _device_for(target: str):
@@ -133,16 +159,54 @@ def smoke_test(config: Plannn3Config, target: str = "c"):
     return l0, l1
 
 
+def smoke_visual(vcfg: Dinov3Config, target: str = "c"):
+    """随机权重跑一次 embed_visual，验证视觉塔图自洽。"""
+    import tvm
+    from tvm import relax
+
+    ex, named_params = compile_visual(vcfg, target)
+    dev = _device_for(target)
+    vm = relax.VirtualMachine(ex, dev)
+    params = _random_params(named_params, dev)
+
+    image = tvm.runtime.tensor(
+        np.random.randn(1, 3, vcfg.image_h, vcfg.image_w).astype(vcfg.dtype), dev
+    )
+    ret = vm["embed_visual"](image, params)
+    out = ret.numpy() if hasattr(ret, "numpy") else ret[0].numpy()
+    hp, wp = vcfg.grid()
+    print(
+        f"[smoke] embed_visual OK, tokens={out.shape} (expect [1,{hp * wp},{vcfg.out_channel}]), "
+        f"finite={np.isfinite(out).all()}"
+    )
+    return out
+
+
 def main():
-    ap = argparse.ArgumentParser(description="MLC-VLA plannn3 compile / smoke (M0)")
+    ap = argparse.ArgumentParser(description="MLC-VLA plannn3 compile / smoke (M0/M1)")
     ap.add_argument("--target", default="c")
     ap.add_argument("--smoke", action="store_true", help="随机权重跑通 prefill + decode_step")
+    ap.add_argument("--visual", action="store_true", help="随机权重跑通视觉塔 embed_visual")
+    ap.add_argument("--generate", action="store_true", help="随机权重跑通宿主 18 步 AR 环")
     ap.add_argument("--dump-ir", action="store_true", help="打印导出的 relax IRModule")
     ap.add_argument("--dummy", action="store_true", help="用 dummy 小尺寸，加速验证")
     args = ap.parse_args()
 
     config = Plannn3Config.dummy() if args.dummy else Plannn3Config()
 
+    if args.visual:
+        vcfg = Dinov3Config.dummy() if args.dummy else Dinov3Config()
+        if args.dump_ir:
+            _, mod, _, _ = build_visual_irmodule(vcfg)
+            print(mod)
+        else:
+            smoke_visual(vcfg, args.target)
+        return
+    if args.generate:
+        from mlc_vla.plannn3_runner import smoke_generate
+
+        smoke_generate(config, args.target)
+        return
     if args.dump_ir:
         _, mod, _, _ = build_irmodule(config)
         print(mod)
