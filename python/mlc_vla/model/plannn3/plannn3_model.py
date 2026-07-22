@@ -183,6 +183,22 @@ class Plannn3Model(nn.Module):
         pad_len = cfg.max_seq_len - cfg.prompt_len
         self._kv_pad = np.zeros((1, pad_len, 2 * cfg.n_embd), cfg.dtype)
 
+    # ---------- 图内 argmax（贪心采样，对齐 infer.py 的 torch.argmax 以做 bit-exact 对拍）----------
+    @staticmethod
+    def _argmax_last(logits: Tensor) -> Tensor:
+        """logits [1,1,vocab] fp32 -> 末维 argmax 的 id [1,1] int32（图内计算）。
+
+        nn 前端未暴露 argmax，用 ``tensor_expr_op`` + ``topi.argmax`` 下沉为 TE，
+        使整段解码环可留在图内（配合 CUDA Graph 整环捕获）。
+        """
+        def _te_argmax(x):
+            from tvm import topi  # noqa: PLC0415
+
+            return topi.argmax(x, axis=-1, keepdims=False)  # [1,1]
+
+        idx = op.tensor_expr_op(_te_argmax, "argmax", [logits])
+        return op.astype(idx, "int32")
+
     # ---------- 可导出函数 ----------
     def embed_token(self, input_ids: Tensor) -> Tensor:
         """单个 traj token id [1,1] -> embedding [1,1,n_embd]。"""
@@ -274,6 +290,44 @@ class Plannn3Model(nn.Module):
         logits = self.traj_head(x)  # [1,1,vocab]
         return logits, kv_new
 
+    def decode_loop_kv(self, token_embeds: Tensor) -> Tensor:
+        """图内整段自回归解码：prefill + 固定 ``pred_times-1`` 步 AR 环，返回 traj id [1,pred_times]。
+
+        把宿主 ``Plannn3Runner.generate`` 的整个环下沉进计算图（对齐 mlc-vla ``denoise_loop_kv``）：
+        - 逐步的 RoPE cos/sin、注意力 add_mask、写入 onehot 均在编译期 bake 为常量
+          （位置 ``pos=prompt_len+step`` 完全确定，无需宿主传入）；
+        - argmax 与 embedding 查表在图内完成，消除每步 host↔device 往返，便于整段 CUDA Graph 捕获；
+        - 直接复用 ``prefill`` / ``decode_step`` 方法体，数值上与宿主逐步环逐算子一致。
+
+        返回离散轨迹 token id ``[1, pred_times]`` (int32)，宿主再走 PCA 反解得到 waypoints。
+        """
+        cfg = self.config
+        max_seq = cfg.max_seq_len
+
+        logits, kv = self.prefill(token_embeds)
+        cur = self._argmax_last(logits)  # [1,1] int32
+        ids: List[Tensor] = [cur]
+
+        idx = np.arange(max_seq)
+        for step in range(cfg.pred_times - 1):
+            pos = cfg.prompt_len + step
+            emb = self.embed_token(cur)  # [1,1,n_embd]
+            cos, sin = _rope_tables_np(1, cfg.head_dim, cfg.rope_theta, offset=pos)
+            add = np.where(idx <= pos, 0.0, cfg.attn_neg_inf).astype("float32").reshape(1, 1, 1, max_seq)
+            onehot = (idx == pos).astype(cfg.dtype).reshape(1, max_seq, 1)
+            logits, kv = self.decode_step(
+                emb,
+                nn.Tensor.from_const(cos),
+                nn.Tensor.from_const(sin),
+                nn.Tensor.from_const(add),
+                nn.Tensor.from_const(onehot),
+                kv,
+            )
+            cur = self._argmax_last(logits)
+            ids.append(cur)
+
+        return op.concat(ids, dim=1)  # [1, pred_times]
+
     # ---------- 导出 spec ----------
     def get_default_spec(self, functions=None):
         cfg = self.config
@@ -295,6 +349,10 @@ class Plannn3Model(nn.Module):
                 "add_mask": nn.spec.Tensor([1, 1, 1, cfg.max_seq_len], "float32"),
                 "write_onehot": nn.spec.Tensor([1, cfg.max_seq_len, 1], self.dtype),
                 "kv": nn.spec.Tensor(kv_shape, self.dtype),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "decode_loop_kv": {
+                "token_embeds": nn.spec.Tensor([1, cfg.prompt_len, cfg.n_embd], self.dtype),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
         }

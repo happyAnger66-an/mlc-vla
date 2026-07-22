@@ -198,12 +198,13 @@ traj_ids(18) ─► TrajTokenizer.decode ─► waypoints
 
 ## 10. 落地路线图
 
-| 里程碑 | 目标 |
-|---|---|
-| **M0** | relax nn 重写 `encode/prefill/decode_step`，`target=llvm` 冒烟跑通，shape/dtype 自洽 |
-| **M1** | 定长 KV buffer + `valid_kv_len` + `where` 写入；宿主 18 步 AR 环；cuda 目标跑通 |
-| **M2** | dlight/cuBLAS + CUDA Graph + 图内 `decode_loop_kv`；与 golden 数值对齐（cosine + bit-exact） |
-| **M3** | group int4 量化；分段编译出库；Orin 端到端延迟基线 |
+| 里程碑 | 目标 | 状态 |
+|---|---|---|
+| **M0** | relax nn 重写 `encode/prefill/decode_step`，`target=llvm` 冒烟跑通，shape/dtype 自洽 | ✅ 见 `M0.md` |
+| **M1** | 定长 KV buffer + `valid_kv_len` + `where` 写入；宿主 18 步 AR 环；cuda 目标跑通 | ✅ 见 `M1.md` |
+| **M2** | dlight/cuBLAS + CUDA Graph + 图内 `decode_loop_kv`；主干/头 loader | ✅ 见 `M2.md` |
+| **M2.5** | 真实 traj 嵌入权重 + 输出反解 + 端到端 `run` + `traj_ids` bit-exact 对拍（vs PyTorch 参考） | ✅ 见 `M3.md` |
+| **M3** | group int4 量化；分段编译出库；Orin 端到端延迟基线；GPU 整网 golden 复核 | ⏳ 待硬件/权重 |
 
 ---
 

@@ -1,8 +1,8 @@
 # TVM vs TensorRT：π0.5 LIBERO 延迟差距与对齐计划
 
 > **本文针对 Ada / RTX4070。Jetson Thor（Blackwell sm_110a）另见 [`tvm_in_thor.md`](tvm_in_thor.md)**
-> —— Thor 上 cuBLAS 已到位，差距在 dlight 非 GEMM kernel（GELU/norm/fp32 attention）未适配 Blackwell，
-> 根因与优先级与 Ada 不同。
+> —— Thor 上 **cuBLAS GEMM 已接上 Blackwell**；差距在 **dlight 非 GEMM 小算子 + fp32 SIMT attention**
+> （缺融合/专调，不是「CUTLASS/cuBLAS 不支持 Thor」），根因与优先级与 Ada 不同。
 >
 > 目标：让 MLC-VLA 的 `prefill` / `denoise_step_kv`（及整环）**对齐甚至优于** Chamleon TRT 同机耗时，同时保持与 openpi 的数值门禁。
 >

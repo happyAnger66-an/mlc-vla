@@ -20,9 +20,18 @@ from mlc_vla.model.plannn3.plannn3_model import _rope_tables_np
 
 
 class Plannn3Runner:
-    """编译 embed_token/prefill/decode_step 三入口，并在宿主编排 18 步自回归。"""
+    """编译 plannn3 解码入口并在宿主编排自回归。
 
-    def __init__(self, config: Plannn3Config, target: str = "c"):
+    两种驱动方式：
+    - ``generate``：宿主逐步环（``prefill`` + ``pred_times-1`` 次 ``decode_step``），
+      ``valid_kv_len``/mask/onehot 宿主推进（trace 稳定，逐步可插桩对拍）；
+    - ``generate_graph``：图内整段环 ``decode_loop_kv``（一次调用跑完，配合 CUDA Graph 整环重放）。
+
+    ``functions`` 控制编译哪些入口（默认两条路径都编）；``cuda_graph``/``cublas`` 透传给编译尾。
+    """
+
+    def __init__(self, config: Plannn3Config, target: str = "c", *, functions=None,
+                 cuda_graph: bool = False, cublas=None):
         import tvm
         from tvm import relax
 
@@ -30,8 +39,10 @@ class Plannn3Runner:
 
         self._tvm = tvm
         self.config = config
+        if functions is None:
+            functions = ["embed_token", "prefill", "decode_step", "decode_loop_kv"]
         self.ex, self.named_params = compile_model(
-            config, target, functions=["embed_token", "prefill", "decode_step"]
+            config, target, functions=functions, cuda_graph=cuda_graph, cublas=cublas
         )
         self.dev = _device_for(target)
         self.vm = relax.VirtualMachine(self.ex, self.dev)
@@ -85,6 +96,38 @@ class Plannn3Runner:
             cur = int(np.argmax(logits.numpy()[0, -1]))
             ids.append(cur)
         return ids
+
+    def generate_graph(self, token_embeds: np.ndarray):
+        """图内整段环：一次 ``decode_loop_kv`` 调用产出 traj id 列表（argmax 在图内）。"""
+        assert self.params is not None, "先 set_params / random_params"
+        cfg = self.config
+        ret = self.vm["decode_loop_kv"](self._t(token_embeds.astype(cfg.dtype)), self.params)
+        ids = self._first(ret).numpy()
+        return ids.reshape(-1).tolist()
+
+    def decode_waypoints(self, traj_ids, pca=None, main_action_length: int = 15,
+                         meta_action_size: int = 3):
+        """离散 traj id -> {meta_action_ids, main_action_ids, [waypoints]}（宿主 numpy 后处理）。"""
+        from mlc_vla.plannn3_decode import decode_traj_ids
+
+        return decode_traj_ids(
+            np.asarray(traj_ids).reshape(1, -1), pca,
+            main_action_length=main_action_length, meta_action_size=meta_action_size,
+        )
+
+    def run(self, token_embeds: np.ndarray, *, use_graph: bool = False, pca=None):
+        """端到端：token_embeds -> traj_ids（TVM 解码）-> waypoints（宿主 PCA 反解）。
+
+        - ``use_graph``：True 走图内 ``decode_loop_kv``（可 CUDA Graph），False 走宿主逐步环；
+        - ``pca``：可选 ``PCATrajDecoder``，给定则一并反解 waypoints。
+
+        注：``token_embeds`` 由 encode 阶段提供——多相机 DINOv3 backbone 走 TVM ``embed_visual``
+        (M1)，多视角/时序/navi/history 外层编排按设计在宿主侧（见 arch.md）。
+        """
+        ids = self.generate_graph(token_embeds) if use_graph else self.generate(token_embeds)
+        out = self.decode_waypoints(ids, pca=pca)
+        out["traj_ids"] = list(map(int, ids))
+        return out
 
 
 def smoke_generate(config: Plannn3Config, target: str = "c"):

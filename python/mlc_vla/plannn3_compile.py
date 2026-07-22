@@ -47,8 +47,59 @@ def build_visual_irmodule(vcfg: Dinov3Config, functions=None):
     return model, mod, named_params, ext_mods
 
 
-def _build_and_compile(mod, named_params, target: str):
-    """公共编译尾：c 目标走 zero pipeline+gcc；其它走默认 pipeline。"""
+def cublas_available() -> bool:
+    """本机 TVM 是否编入 cuBLAS BYOC 扩展（``relax.ext.cublas``）。
+
+    无扩展时若强开 cuBLAS，``RunCodegen`` 生成的 extern 调用会在 build 期失败；据此自动回退。
+    对齐 ``mlc_vla.compile.cublas_available``。
+    """
+    try:
+        import tvm
+
+        return bool(tvm.get_global_func("relax.ext.cublas", True))
+    except Exception:  # noqa: BLE001 - 探测失败一律视为不可用并回退 dlight
+        return False
+
+
+def resolve_cublas(cublas, target_kind: str) -> bool:
+    """把三态 ``cublas``（None=自动 / True / False）解析成实际是否启用（仅 CUDA 目标）。"""
+    if target_kind != "cuda":
+        return False
+    avail = cublas_available()
+    if cublas is None:
+        return avail
+    if cublas and not avail:
+        import warnings
+
+        warnings.warn(
+            "cublas=True 但本机 TVM 未启用 relax.ext.cublas 扩展，回退 dlight GEMM。",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return bool(cublas)
+
+
+def apply_gemm_prepasses(mod, tgt):
+    """CUDA 目标下把 matmul 卸载 cuBLAS 并融合 transpose+matmul（对齐 mlc_vla.compile）。"""
+    from tvm import relax
+    from tvm.relax.backend.cuda.cublas import partition_for_cublas
+
+    with tgt:
+        mod = partition_for_cublas(mod)
+        mod = relax.transform.RunCodegen()(mod)
+        mod = relax.transform.FuseTransposeMatmul()(mod)
+    return mod
+
+
+def _build_and_compile(mod, named_params, target: str, cuda_graph: bool = False, cublas=None):
+    """公共编译尾：c 目标走 zero pipeline+gcc；CUDA 可选 cuBLAS BYOC + CUDA Graph；其它走默认 pipeline。
+
+    - ``cuda_graph``：CUDA 目标下开启 ``relax.backend.use_cuda_graph``，把静态 kernel 序列
+      捕获成 CUDA Graph（decode 单步或 ``decode_loop_kv`` 整环一次 launch 重放）。
+    - ``cublas``：三态。``None`` 在 CUDA 且扩展可用时自动开启（把 matmul 卸载 cuBLAS + 吃掉转置税）。
+      不可用时默认 pipeline 内的 dlight 会给出 GEMM/GEMV/Reduction 调度作为回退。
+    """
     import os
     import tempfile
 
@@ -64,25 +115,33 @@ def _build_and_compile(mod, named_params, target: str):
         so_path = os.path.join(tempfile.mkdtemp(prefix="mlc_vla_p3_"), "plannn3.so")
         ex.export_library(so_path)
         return tvm.runtime.load_module(so_path), named_params
-    with tgt:
+    if resolve_cublas(cublas, tgt.kind.name):
+        mod = apply_gemm_prepasses(mod, tgt)
+    pass_cfg = (
+        {"relax.backend.use_cuda_graph": True} if (cuda_graph and tgt.kind.name == "cuda") else {}
+    )
+    with tgt, tvm.transform.PassContext(config=pass_cfg):
         ex = relax.build(mod, target=tgt, relax_pipeline=relax.get_default_pipeline(tgt))
     return ex, named_params
 
 
-def compile_visual(vcfg: Dinov3Config, target: str = "c", functions=None):
+def compile_visual(vcfg: Dinov3Config, target: str = "c", functions=None,
+                   cuda_graph: bool = False, cublas=None):
     """编译 DINOv3 视觉塔，返回 (VM 可加载对象, named_params)。"""
     _, mod, named_params, _ = build_visual_irmodule(vcfg, functions=functions)
-    return _build_and_compile(mod, named_params, target)
+    return _build_and_compile(mod, named_params, target, cuda_graph=cuda_graph, cublas=cublas)
 
 
-def compile_model(config: Plannn3Config, target: str = "c", functions=None):
+def compile_model(config: Plannn3Config, target: str = "c", functions=None,
+                  cuda_graph: bool = False, cublas=None):
     """编译模型，返回 (VM 可加载对象, named_params)。
 
     - ``c`` 目标（默认 CPU 路径）：zero pipeline + 本机 gcc 编译为 .so 后加载。
-    - 其它目标（llvm/cuda/...）：使用 target 感知的默认 pipeline。
+    - CUDA 目标：默认 pipeline（含 dlight），可选 cuBLAS BYOC（``cublas``）与 CUDA Graph（``cuda_graph``）。
+    - 其它目标（llvm/...）：使用 target 感知的默认 pipeline。
     """
     _, mod, named_params, _ = build_irmodule(config, functions=functions)
-    return _build_and_compile(mod, named_params, target)
+    return _build_and_compile(mod, named_params, target, cuda_graph=cuda_graph, cublas=cublas)
 
 
 def _device_for(target: str):
@@ -159,6 +218,30 @@ def smoke_test(config: Plannn3Config, target: str = "c"):
     return l0, l1
 
 
+def smoke_loop(config: Plannn3Config, target: str = "c", cuda_graph: bool = False, cublas=None):
+    """随机权重跑通图内整段解码环 ``decode_loop_kv``，验证图自洽（含图内 argmax）。"""
+    import tvm
+    from tvm import relax
+
+    ex, named_params = compile_model(
+        config, target, functions=["decode_loop_kv"], cuda_graph=cuda_graph, cublas=cublas
+    )
+    dev = _device_for(target)
+    vm = relax.VirtualMachine(ex, dev)
+    params = _random_params(named_params, dev)
+
+    token_embeds = tvm.runtime.tensor(
+        np.random.randn(1, config.prompt_len, config.n_embd).astype(config.dtype), dev
+    )
+    ret = vm["decode_loop_kv"](token_embeds, params)
+    ids = ret.numpy() if hasattr(ret, "numpy") else ret[0].numpy()
+    print(
+        f"[smoke] decode_loop_kv OK, traj_ids={ids.shape} (expect [1,{config.pred_times}]): "
+        f"{ids.reshape(-1).tolist()}"
+    )
+    return ids
+
+
 def smoke_visual(vcfg: Dinov3Config, target: str = "c"):
     """随机权重跑一次 embed_visual，验证视觉塔图自洽。"""
     import tvm
@@ -188,8 +271,14 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="随机权重跑通 prefill + decode_step")
     ap.add_argument("--visual", action="store_true", help="随机权重跑通视觉塔 embed_visual")
     ap.add_argument("--generate", action="store_true", help="随机权重跑通宿主 18 步 AR 环")
+    ap.add_argument("--loop", action="store_true", help="随机权重跑通图内整段解码环 decode_loop_kv")
     ap.add_argument("--dump-ir", action="store_true", help="打印导出的 relax IRModule")
     ap.add_argument("--dummy", action="store_true", help="用 dummy 小尺寸，加速验证")
+    ap.add_argument("--cuda-graph", action="store_true", help="CUDA 目标下开启 CUDA Graph 捕获")
+    ap.add_argument("--cublas", dest="cublas", action="store_true", default=None,
+                    help="强制启用 cuBLAS BYOC（默认自动探测；不可用回退 dlight）")
+    ap.add_argument("--no-cublas", dest="cublas", action="store_false",
+                    help="强制禁用 cuBLAS BYOC，走 dlight")
     args = ap.parse_args()
 
     config = Plannn3Config.dummy() if args.dummy else Plannn3Config()
@@ -207,6 +296,9 @@ def main():
 
         smoke_generate(config, args.target)
         return
+    if args.loop:
+        smoke_loop(config, args.target, cuda_graph=args.cuda_graph, cublas=args.cublas)
+        return
     if args.dump_ir:
         _, mod, _, _ = build_irmodule(config)
         print(mod)
@@ -214,7 +306,7 @@ def main():
     if args.smoke:
         smoke_test(config, args.target)
         return
-    compile_model(config, args.target)
+    compile_model(config, args.target, cuda_graph=args.cuda_graph, cublas=args.cublas)
     print("[compile] build OK")
 
 
